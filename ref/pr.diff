@@ -1,0 +1,3442 @@
+diff --git a/.github/workflows/pr-test.yml b/.github/workflows/pr-test.yml
+index 6e3bfe7fab..559530beea 100644
+--- a/.github/workflows/pr-test.yml
++++ b/.github/workflows/pr-test.yml
+@@ -611,6 +611,91 @@ jobs:
+       - name: Run H100 Kernel Tests
+         run: bash ci/bash.sh ${DOCKER_IMAGE} ./scripts/task_run_unit_tests.sh
+ 
++  # ---------------------------------------------------------------------------
++  # DLLM Block Extend Attention Tests
++  # ---------------------------------------------------------------------------
++  gpu-tests-dllm-a10g:
++    name: DLLM Block Extend Tests (A10G)
++    needs: [gate, setup]
++    if: |
++      needs.gate.outputs.authorized == 'true' &&
++      needs.setup.outputs.skip_build != 'true' &&
++      github.event.inputs.skip_gpu != 'true'
++    runs-on: [self-hosted, linux, x64, gpu, sm86, spot]
++    timeout-minutes: 60
++    env:
++      DOCKER_IMAGE: flashinfer/flashinfer-ci-cu129:${{ needs.setup.outputs.docker_tag }}
++    steps:
++      - name: Cleanup
++        run: |
++          docker stop $(docker ps -q) 2>/dev/null || true
++          docker rm $(docker ps -aq) 2>/dev/null || true
++          sudo rm -rf ${{ github.workspace }}/* || true
++          sudo rm -rf ${{ github.workspace }}/.[!.]* || true
++          rm -rf ~/.cache/flashinfer_jit || true
++          docker image prune -f || true
++          docker builder prune -f --filter "until=24h" || true
++          nvidia-smi || true
++
++      - uses: actions/checkout@v4
++        with:
++          submodules: recursive
++
++      - name: Start spot termination monitor
++        run: ./scripts/task_monitor_spot.sh &
++
++      - name: Show Node Info
++        run: ./scripts/task_show_node_info.sh
++        env:
++          NODE_NAME: ${{ runner.name }}
++          WORKSPACE: ${{ github.workspace }}
++          BUILD_NUMBER: ${{ github.run_number }}
++
++      - name: Run DLLM Block Extend Tests
++        run: bash ci/bash.sh ${DOCKER_IMAGE} ./scripts/task_jit_run_tests_dllm.sh
++
++  gpu-tests-dllm-h100:
++    name: DLLM Block Extend Tests (H100)
++    needs: [gate, setup]
++    if: |
++      needs.gate.outputs.authorized == 'true' &&
++      needs.setup.outputs.skip_build != 'true' &&
++      github.event.inputs.skip_gpu != 'true'
++    runs-on: [self-hosted, linux, x64, gpu, h100]
++    timeout-minutes: 60
++    env:
++      DOCKER_IMAGE: flashinfer/flashinfer-ci-cu129:${{ needs.setup.outputs.docker_tag }}
++    steps:
++      - name: Cleanup
++        run: |
++          for cid in $(docker ps -q); do
++            if docker inspect "$cid" --format '{{json .Mounts}}' 2>/dev/null | grep -qF "${{ github.workspace }}/"; then
++              docker stop "$cid" 2>/dev/null || true
++            fi
++          done
++          sudo rm -rf ${{ github.workspace }}/* || true
++          sudo rm -rf ${{ github.workspace }}/.[!.]* || true
++          rm -rf ~/.cache/flashinfer_jit || true
++          docker container prune -f 2>/dev/null || true
++          docker image prune -f || true
++          docker builder prune -f --filter "until=24h" || true
++          echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
++          nvidia-smi -i "$CUDA_VISIBLE_DEVICES" || true
++
++      - uses: actions/checkout@v4
++        with:
++          submodules: recursive
++
++      - name: Show Node Info
++        run: ./scripts/task_show_node_info.sh
++        env:
++          NODE_NAME: ${{ runner.name }}
++          WORKSPACE: ${{ github.workspace }}
++          BUILD_NUMBER: ${{ github.run_number }}
++
++      - name: Run DLLM Block Extend Tests
++        run: bash ci/bash.sh ${DOCKER_IMAGE} ./scripts/task_jit_run_tests_dllm.sh
++
+   # ---------------------------------------------------------------------------
+   # Test Results Summary
+   # ---------------------------------------------------------------------------
+@@ -630,6 +715,8 @@ jobs:
+       - analyze-gpu-t4-failure
+       - gpu-tests-t4-rerun
+       - gpu-tests-h100
++      - gpu-tests-dllm-a10g
++      - gpu-tests-dllm-h100
+     runs-on: ubuntu-latest
+     steps:
+       - name: Check Authorization
+@@ -737,6 +824,21 @@ jobs:
+             FAILED=true
+           fi
+ 
++          # DLLM tests (no rerun logic - short-running jobs)
++          echo "" >> $GITHUB_STEP_SUMMARY
++          DLLM_A10G="${{ needs.gpu-tests-dllm-a10g.result }}"
++          echo "DLLM Tests (A10G): $DLLM_A10G" >> $GITHUB_STEP_SUMMARY
++          if [ "$DLLM_A10G" != "success" ] && [ "$DLLM_A10G" != "skipped" ] && [ "${{ github.event.inputs.skip_gpu }}" != "true" ]; then
++            FAILED=true
++          fi
++
++          echo "" >> $GITHUB_STEP_SUMMARY
++          DLLM_H100="${{ needs.gpu-tests-dllm-h100.result }}"
++          echo "DLLM Tests (H100): $DLLM_H100" >> $GITHUB_STEP_SUMMARY
++          if [ "$DLLM_H100" != "success" ] && [ "$DLLM_H100" != "skipped" ] && [ "${{ github.event.inputs.skip_gpu }}" != "true" ]; then
++            FAILED=true
++          fi
++
+           echo "" >> $GITHUB_STEP_SUMMARY
+           if [ "$FAILED" == "true" ]; then
+             echo "Result: Tests Failed" >> $GITHUB_STEP_SUMMARY
+diff --git a/csrc/batch_prefill_customize_config.jinja b/csrc/batch_prefill_customize_config.jinja
+index 77490d71b2..e96f499cd8 100644
+--- a/csrc/batch_prefill_customize_config.jinja
++++ b/csrc/batch_prefill_customize_config.jinja
+@@ -76,6 +76,22 @@ struct RaggedParams {
+   __host__ __device__ __forceinline__ uint32_t get_kv_len(uint32_t batch_idx) const {
+     return kv_indptr[batch_idx + 1] - kv_indptr[batch_idx];
+   }
++
++  __host__ __device__ __forceinline__ uint32_t get_q_block_expanding_offset(uint32_t batch_idx) const {
++{% if 'maybe_q_block_expanding_offset' in additional_params_decl %}
++    return (maybe_q_block_expanding_offset != nullptr) ? maybe_q_block_expanding_offset[batch_idx] : 0;
++{% else %}
++    return 0;
++{% endif %}
++  }
++
++  __host__ __device__ __forceinline__ uint32_t get_kv_block_expanding_offset(uint32_t batch_idx) const {
++{% if 'maybe_kv_block_expanding_offset' in additional_params_decl %}
++    return (maybe_kv_block_expanding_offset != nullptr) ? maybe_kv_block_expanding_offset[batch_idx] : 0;
++{% else %}
++    return 0;
++{% endif %}
++  }
+ };
+ 
+ struct PagedParams {
+@@ -116,6 +132,22 @@ struct PagedParams {
+   __host__ __device__ __forceinline__ uint32_t get_kv_len(uint32_t batch_idx) const {
+     return paged_kv.get_length(batch_idx);
+   }
++
++  __host__ __device__ __forceinline__ uint32_t get_q_block_expanding_offset(uint32_t batch_idx) const {
++{% if 'maybe_q_block_expanding_offset' in additional_params_decl %}
++    return (maybe_q_block_expanding_offset != nullptr) ? maybe_q_block_expanding_offset[batch_idx] : 0;
++{% else %}
++    return 0;
++{% endif %}
++  }
++
++  __host__ __device__ __forceinline__ uint32_t get_kv_block_expanding_offset(uint32_t batch_idx) const {
++{% if 'maybe_kv_block_expanding_offset' in additional_params_decl %}
++    return (maybe_kv_block_expanding_offset != nullptr) ? maybe_kv_block_expanding_offset[batch_idx] : 0;
++{% else %}
++    return 0;
++{% endif %}
++  }
+ };
+ 
+ {{ variant_decl }}
+diff --git a/csrc/batch_prefill_sm90_customize_config.jinja b/csrc/batch_prefill_sm90_customize_config.jinja
+index 640637c7df..373e469343 100644
+--- a/csrc/batch_prefill_sm90_customize_config.jinja
++++ b/csrc/batch_prefill_sm90_customize_config.jinja
+@@ -66,6 +66,31 @@ struct RaggedParams {
+   int window_left;
+ 
+   bool causal;
++
++  // Block Expanding support
++  __host__ __device__ __forceinline__ uint32_t get_qo_len(uint32_t batch_idx) const {
++    return qo_lens[batch_idx];
++  }
++
++  __host__ __device__ __forceinline__ uint32_t get_kv_len(uint32_t batch_idx) const {
++    return kv_lens[batch_idx];
++  }
++
++  __host__ __device__ __forceinline__ uint32_t get_q_block_expanding_offset(uint32_t batch_idx) const {
++{% if 'maybe_q_block_expanding_offset' in additional_params_decl %}
++    return (additional_params.maybe_q_block_expanding_offset != nullptr) ? additional_params.maybe_q_block_expanding_offset[batch_idx] : 0;
++{% else %}
++    return 0;
++{% endif %}
++  }
++
++  __host__ __device__ __forceinline__ uint32_t get_kv_block_expanding_offset(uint32_t batch_idx) const {
++{% if 'maybe_kv_block_expanding_offset' in additional_params_decl %}
++    return (additional_params.maybe_kv_block_expanding_offset != nullptr) ? additional_params.maybe_kv_block_expanding_offset[batch_idx] : 0;
++{% else %}
++    return 0;
++{% endif %}
++  }
+ };
+ 
+ struct PagedParams {
+@@ -117,6 +142,31 @@ struct PagedParams {
+   int window_left;
+ 
+   bool causal;
++
++  // Block Expanding support
++  __host__ __device__ __forceinline__ uint32_t get_qo_len(uint32_t batch_idx) const {
++    return qo_lens[batch_idx];
++  }
++
++  __host__ __device__ __forceinline__ uint32_t get_kv_len(uint32_t batch_idx) const {
++    return kv_lens[batch_idx];
++  }
++
++  __host__ __device__ __forceinline__ uint32_t get_q_block_expanding_offset(uint32_t batch_idx) const {
++{% if 'maybe_q_block_expanding_offset' in additional_params_decl %}
++    return (additional_params.maybe_q_block_expanding_offset != nullptr) ? additional_params.maybe_q_block_expanding_offset[batch_idx] : 0;
++{% else %}
++    return 0;
++{% endif %}
++  }
++
++  __host__ __device__ __forceinline__ uint32_t get_kv_block_expanding_offset(uint32_t batch_idx) const {
++{% if 'maybe_kv_block_expanding_offset' in additional_params_decl %}
++    return (additional_params.maybe_kv_block_expanding_offset != nullptr) ? additional_params.maybe_kv_block_expanding_offset[batch_idx] : 0;
++{% else %}
++    return 0;
++{% endif %}
++  }
+ };
+ 
+ {{ variant_decl }}
+diff --git a/csrc/single_prefill_customize_config.jinja b/csrc/single_prefill_customize_config.jinja
+index fa31e08b7b..0592531a5c 100644
+--- a/csrc/single_prefill_customize_config.jinja
++++ b/csrc/single_prefill_customize_config.jinja
+@@ -67,6 +67,26 @@ struct Params {
+   __host__ __device__ __forceinline__ uint32_t get_kv_len(uint32_t batch_idx) const {
+     return kv_len;
+   }
++
++  // SinglePrefill: q_block_expanding_offset support
++  // If q_block_expanding_offset parameter is provided, use it; otherwise return 0
++  __host__ __device__ __forceinline__ uint32_t get_q_block_expanding_offset(uint32_t batch_idx) const {
++{% if has_q_block_expanding_offset %}
++    return static_cast<uint32_t>(q_block_expanding_offset);
++{% else %}
++    return 0;
++{% endif %}
++  }
++
++  // SinglePrefill: kv_block_expanding_offset support (for Cascade Current Chunk)
++  // If kv_block_expanding_offset parameter is provided, use it; otherwise return 0
++  __host__ __device__ __forceinline__ uint32_t get_kv_block_expanding_offset(uint32_t batch_idx) const {
++{% if has_kv_block_expanding_offset %}
++    return static_cast<uint32_t>(kv_block_expanding_offset);
++{% else %}
++    return 0;
++{% endif %}
++  }
+ };
+ 
+ {{ variant_decl }}
+diff --git a/csrc/single_prefill_sm90_customize_config.jinja b/csrc/single_prefill_sm90_customize_config.jinja
+index 7922ca2ba9..4446dde203 100644
+--- a/csrc/single_prefill_sm90_customize_config.jinja
++++ b/csrc/single_prefill_sm90_customize_config.jinja
+@@ -62,6 +62,33 @@ struct Params {
+   int window_left;
+ 
+   bool causal;
++
++  // Block Expanding support
++  __host__ __device__ __forceinline__ uint32_t get_qo_len(uint32_t batch_idx) const {
++    return qo_len;
++  }
++
++  __host__ __device__ __forceinline__ uint32_t get_kv_len(uint32_t batch_idx) const {
++    return kv_len;
++  }
++
++  // SinglePrefill: q_block_expanding_offset support
++  __host__ __device__ __forceinline__ uint32_t get_q_block_expanding_offset(uint32_t batch_idx) const {
++{% if has_q_block_expanding_offset %}
++    return static_cast<uint32_t>(additional_params.q_block_expanding_offset);
++{% else %}
++    return 0;
++{% endif %}
++  }
++
++  // SinglePrefill: kv_block_expanding_offset support (for Cascade Current Chunk)
++  __host__ __device__ __forceinline__ uint32_t get_kv_block_expanding_offset(uint32_t batch_idx) const {
++{% if has_kv_block_expanding_offset %}
++    return static_cast<uint32_t>(additional_params.kv_block_expanding_offset);
++{% else %}
++    return 0;
++{% endif %}
++  }
+ };
+ 
+ {{ variant_decl }}
+diff --git a/flashinfer/__init__.py b/flashinfer/__init__.py
+index 4a775eab67..b1b31cd5ba 100644
+--- a/flashinfer/__init__.py
++++ b/flashinfer/__init__.py
+@@ -20,6 +20,7 @@
+ from .version import __version__ as __version__
+ from .version import __git_version__ as __git_version__
+ 
++from . import dllm as dllm
+ 
+ from . import jit as jit
+ from .activation import gelu_and_mul as gelu_and_mul
+diff --git a/flashinfer/dllm/__init__.py b/flashinfer/dllm/__init__.py
+new file mode 100644
+index 0000000000..2d280885de
+--- /dev/null
++++ b/flashinfer/dllm/__init__.py
+@@ -0,0 +1,33 @@
++from .block_extend import (
++    block_extend_attention_with_offset,
++    block_extend_cascade,
++    get_block_extend_module_with_offset,
++    BLOCK_EXTEND_V2_WITH_OFFSET_VARIANT_DECL,
++    BLOCK_EXTEND_V3_WITH_OFFSET_VARIANT_DECL,
++)
++
++from .batch_block_extend import (
++    BatchBlockExtendPagedOffsetWrapper,
++    BatchBlockExtendRaggedOffsetWrapper,
++    batch_block_extend_cascade,
++    sglang_style_cascade_attention,
++    _BATCH_BE_OFFSET_VARIANT_DECL,
++    _BATCH_BE_OFFSET_VARIANT_DECL_FA3,
++    _check_batch_be_aot_available,
++    _get_batch_be_aot_path,
++    _get_batch_be_module_uri,
++)
++
++__all__ = [
++    "BLOCK_EXTEND_V2_WITH_OFFSET_VARIANT_DECL",
++    "BLOCK_EXTEND_V3_WITH_OFFSET_VARIANT_DECL",
++    "BatchBlockExtendPagedOffsetWrapper",
++    "BatchBlockExtendRaggedOffsetWrapper",
++    "_BATCH_BE_OFFSET_VARIANT_DECL",
++    "_BATCH_BE_OFFSET_VARIANT_DECL_FA3",
++    "batch_block_extend_cascade",
++    "block_extend_attention_with_offset",
++    "block_extend_cascade",
++    "get_block_extend_module_with_offset",
++    "sglang_style_cascade_attention",
++]
+diff --git a/flashinfer/dllm/batch_block_extend.py b/flashinfer/dllm/batch_block_extend.py
+new file mode 100644
+index 0000000000..5db32d1d9e
+--- /dev/null
++++ b/flashinfer/dllm/batch_block_extend.py
+@@ -0,0 +1,692 @@
++"""
++Batch Block Extend Attention for DLLM (Diffusion LLM)
++
++Block Extend Mask Rules:
++  q_global = q_offset + q_idx
++  kv_global = kv_offset + kv_idx
++  mask[q, k] = (q_global / dllm_block_size) >= (kv_global / dllm_block_size)
++  Bidirectional visibility within the same block, can see previous blocks, cannot see subsequent blocks
++
++Usage:
++    from flashinfer.dllm import BatchBlockExtendRaggedOffsetWrapper
++        wrapper = BatchBlockExtendRaggedOffsetWrapper(workspace, kv_layout="NHD", dllm_block_size=32)
++    wrapper.plan(qo_indptr, kv_indptr, num_heads, num_kv_heads, head_dim)
++    output = wrapper.run(q, k, v)
++"""
++
++from __future__ import annotations
++
++import math
++import os
++import torch
++from pathlib import Path
++from typing import Optional, Tuple, Union, List, Dict, Any
++
++from ..prefill import (
++    BatchPrefillWithRaggedKVCacheWrapper,
++    BatchPrefillWithPagedKVCacheWrapper,
++)
++from ..jit import gen_customize_batch_prefill_module
++from ..jit import env as jit_env
++from ..utils import MaskMode
++from ..api_logging import flashinfer_api
++
++
++def check_jit_environment() -> dict:
++    """Check if JIT compilation environment is working properly"""
++    results = {
++        "tvm_ffi_ok": False,
++        "device_guard_ok": False,
++        "nvcc_ok": False,
++        "issues": [],
++    }
++    
++    try:
++        import tvm_ffi
++        results["tvm_ffi_ok"] = True
++        include_path = tvm_ffi.libinfo.find_include_path()
++        device_guard_path = Path(include_path) / "tvm" / "ffi" / "extra" / "cuda" / "device_guard.h"
++        results["device_guard_ok"] = device_guard_path.exists()
++        if not results["device_guard_ok"]:
++            results["issues"].append(f"Missing TVM header: {device_guard_path}")
++    except ImportError:
++        results["issues"].append("tvm_ffi package not installed")
++    except Exception as e:
++        results["issues"].append(f"Error checking tvm_ffi: {e}")
++    
++    import subprocess
++    try:
++        result = subprocess.run(["nvcc", "--version"], capture_output=True, text=True)
++        results["nvcc_ok"] = result.returncode == 0
++    except FileNotFoundError:
++        results["nvcc_ok"] = False
++        results["issues"].append("nvcc not found in PATH")
++    
++    return results
++
++
++def check_kernel_availability(uri: str) -> tuple:
++    """Check availability of specified kernel"""
++    aot_path = jit_env.FLASHINFER_AOT_DIR / uri / f"{uri}.so"
++    aot_available = aot_path.exists()
++    
++    jit_env_check = check_jit_environment()
++    jit_available = (
++        jit_env_check["tvm_ffi_ok"] and 
++        jit_env_check["device_guard_ok"] and 
++        jit_env_check["nvcc_ok"]
++    )
++    
++    return aot_available, jit_available, aot_path
++
++
++def select_best_backend(head_dim: int, dtype: torch.dtype, preferred_backend: str = "auto", device: torch.device = None) -> str:
++    """Select backend based on kernel availability and compute capability"""
++    from ..utils import is_sm90a_supported
++    
++    base_uri = _get_batch_be_module_uri(head_dim, dtype)
++    fa2_uri = base_uri + "_ragged_offset"
++    fa3_uri = base_uri + "_ragged_offset_fa3"
++    
++    fa2_aot, fa2_jit, _ = check_kernel_availability(fa2_uri)
++    fa3_aot, fa3_jit, _ = check_kernel_availability(fa3_uri)
++    
++    fa2_available = fa2_aot or fa2_jit
++    fa3_available = fa3_aot or fa3_jit
++    
++    if preferred_backend == "auto":
++        if device is None:
++            device = torch.device("cuda")
++        is_hopper = is_sm90a_supported(device)
++        
++        if is_hopper:
++            if fa3_available:
++                return "fa3"
++            if fa2_available:
++                return "fa2"
++        else:
++            if fa2_available:
++                return "fa2"
++            if fa3_available:
++                return "fa3"
++        
++        raise RuntimeError(
++            f"No Block Extend kernel available for head_dim={head_dim}, dtype={dtype}. "
++            f"FA2: AOT={fa2_aot}, JIT={fa2_jit}; FA3: AOT={fa3_aot}, JIT={fa3_jit}"
++        )
++    
++    if preferred_backend == "fa2":
++        if fa2_available:
++            return "fa2"
++        raise RuntimeError(f"FA2 kernel '{fa2_uri}' not available")
++
++    if preferred_backend == "fa3":
++        if device is None:
++            device = torch.device("cuda")
++        if not is_sm90a_supported(device):
++            raise RuntimeError(
++                f"FA3 backend requires SM90 (Hopper) architecture, "
++                f"current device does not support it"
++            )
++        if fa3_available:
++            return "fa3"
++        raise RuntimeError(f"FA3 kernel '{fa3_uri}' not available")
++
++    raise ValueError(f"Unknown backend: {preferred_backend}")
++
++
++def select_best_backend_paged(head_dim: int, dtype: torch.dtype, preferred_backend: str = "auto", device: torch.device = None) -> str:
++    """Select backend based on Paged kernel availability and compute capability"""
++    from ..utils import is_sm90a_supported
++
++    base_uri = _get_batch_be_module_uri(head_dim, dtype)
++    fa2_uri = base_uri + "_paged_offset"
++    fa3_uri = base_uri + "_paged_offset_fa3"
++
++    fa2_aot, fa2_jit, _ = check_kernel_availability(fa2_uri)
++    fa3_aot, fa3_jit, _ = check_kernel_availability(fa3_uri)
++
++    fa2_available = fa2_aot or fa2_jit
++    fa3_available = fa3_aot or fa3_jit
++
++    if preferred_backend == "auto":
++        if device is None:
++            device = torch.device("cuda")
++        is_hopper = is_sm90a_supported(device)
++
++        if is_hopper:
++            if fa3_available:
++                return "fa3"
++            if fa2_available:
++                return "fa2"
++        else:
++            if fa2_available:
++                return "fa2"
++            if fa3_available:
++                return "fa3"
++
++        raise RuntimeError(
++            f"No Paged Block Extend kernel available for head_dim={head_dim}, dtype={dtype}"
++        )
++
++    if preferred_backend == "fa2":
++        if fa2_available:
++            return "fa2"
++        raise RuntimeError(f"FA2 paged kernel '{fa2_uri}' not available")
++
++    if preferred_backend == "fa3":
++        if device is None:
++            device = torch.device("cuda")
++        if not is_sm90a_supported(device):
++            raise RuntimeError(
++                f"FA3 backend requires SM90 (Hopper) architecture, "
++                f"current device does not support it"
++            )
++        if fa3_available:
++            return "fa3"
++        raise RuntimeError(f"FA3 paged kernel '{fa3_uri}' not available")
++
++    raise ValueError(f"Unknown backend: {preferred_backend}")
++
++
++def _get_batch_be_module_uri(head_dim: int, dtype: torch.dtype) -> str:
++    _dtype_map = {torch.float16: "fp16", torch.bfloat16: "bf16"}
++    if dtype not in _dtype_map:
++        raise ValueError(
++            f"Unsupported dtype {dtype} for Block Extend Attention. "
++            f"Supported: {list(_dtype_map.keys())}"
++        )
++    return f"batch_prefill_block_expanding_hd{head_dim}_{_dtype_map[dtype]}"
++
++
++def _get_batch_be_aot_path(uri: str) -> Path:
++    return jit_env.FLASHINFER_AOT_DIR / uri / f"{uri}.so"
++
++
++def _check_batch_be_aot_available(uri: str) -> bool:
++    if os.environ.get("FLASHINFER_FORCE_JIT", "0") == "1":
++        return False
++    return _get_batch_be_aot_path(uri).exists()
++
++
++# FA2 Offset Variant
++_BATCH_BE_OFFSET_VARIANT_DECL = r"""
++struct BatchBlockExtendOffsetAttention : AttentionVariantBase {
++  static constexpr bool use_softmax = true;
++
++  uint32_t qo_len;
++  uint32_t kv_len;
++  uint32_t window_left;
++  float sm_scale_log2;
++
++  template <typename Params>
++  __device__ __host__ BatchBlockExtendOffsetAttention(const Params& params, uint32_t batch_idx,
++                                                           uint8_t* smem_ptr) {
++    qo_len = params.get_qo_len(batch_idx);
++    kv_len = params.get_kv_len(batch_idx);
++    sm_scale_log2 = params.sm_scale * math::log2e;
++    window_left = kv_len;
++  }
++
++  REGISTER_LOGITS_MASK(params, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, {
++    return true;
++  });
++
++  REGISTER_LOGITS_TRANSFORM(params, logits, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, {
++    return logits;
++  });
++};
++"""
++
++# FA3 Offset Variant
++_BATCH_BE_OFFSET_VARIANT_DECL_FA3 = r"""
++struct BatchBlockExtendOffsetAttentionFA3 : AttentionVariantBase {
++  float sm_scale_log2;
++
++  template <typename MainloopParams, typename BlockCoord>
++  __device__ __host__ BatchBlockExtendOffsetAttentionFA3(
++      const MainloopParams& params, const BlockCoord& block_coord) {
++    sm_scale_log2 = params.additional_params.sm_scale * math::log2e;
++  }
++
++  template <int NUM_ROWS_PER_THREAD>
++  __device__ auto GetAttentionUpdater() {
++    return OnlineSoftmax<NUM_ROWS_PER_THREAD, /*WITH_SCALE=*/true>(sm_scale_log2);
++  }
++
++  REGISTER_LOGITS_TRANSFORM(params, logits, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, {
++    return logits;
++  });
++};
++"""
++
++
++class BatchBlockExtendPagedOffsetWrapper:
++    """Batch Block Extend Paged Attention with Offset Support"""
++    
++    @flashinfer_api
++    def __init__(
++        self,
++        float_workspace_buffer: torch.Tensor,
++        kv_layout: str = "NHD",
++        dllm_block_size: int = 256,
++        use_cuda_graph: bool = False,
++        qo_indptr_buf: Optional[torch.Tensor] = None,
++        paged_kv_indptr_buf: Optional[torch.Tensor] = None,
++        paged_kv_indices_buf: Optional[torch.Tensor] = None,
++        paged_kv_last_page_len_buf: Optional[torch.Tensor] = None,
++        q_offsets_buf: Optional[torch.Tensor] = None,
++        kv_offsets_buf: Optional[torch.Tensor] = None,
++        backend: str = "auto",
++    ) -> None:
++        assert dllm_block_size > 0 and (dllm_block_size & (dllm_block_size - 1)) == 0, \
++            f"dllm_block_size must be a positive power of 2, got {dllm_block_size}"
++        
++        self._dllm_block_size = dllm_block_size
++        self._kv_layout = kv_layout
++        self._backend = backend
++        self._preferred_backend = backend
++        self._device = float_workspace_buffer.device
++        self._dtype: Optional[torch.dtype] = None
++        self._head_dim: Optional[int] = None
++        self._idtype: Optional[torch.dtype] = None
++        
++        self._float_workspace_buffer = float_workspace_buffer
++        self._use_cuda_graph = use_cuda_graph
++        self._qo_indptr_buf = qo_indptr_buf
++        self._paged_kv_indptr_buf = paged_kv_indptr_buf
++        self._paged_kv_indices_buf = paged_kv_indices_buf
++        self._paged_kv_last_page_len_buf = paged_kv_last_page_len_buf
++        self._q_offsets_buf = q_offsets_buf
++        self._kv_offsets_buf = kv_offsets_buf
++        
++        self._inner_wrapper: Optional[BatchPrefillWithPagedKVCacheWrapper] = None
++        self._q_offsets: Optional[torch.Tensor] = None
++        self._kv_offsets: Optional[torch.Tensor] = None
++    
++    def _create_inner_wrapper(self, dtype: torch.dtype, head_dim: int, idtype: torch.dtype = torch.int32) -> None:
++        effective_backend = select_best_backend_paged(head_dim, dtype, self._preferred_backend, self._device)
++        self._backend = effective_backend
++        
++        if self._backend == "fa3":
++            uri = _get_batch_be_module_uri(head_dim, dtype) + "_paged_offset_fa3"
++            variant_name = "BatchBlockExtendOffsetAttentionFA3"
++            variant_decl = _BATCH_BE_OFFSET_VARIANT_DECL_FA3
++        else:
++            uri = _get_batch_be_module_uri(head_dim, dtype) + "_paged_offset"
++            variant_name = "BatchBlockExtendOffsetAttention"
++            variant_decl = _BATCH_BE_OFFSET_VARIANT_DECL
++        
++        jit_args = [
++            uri, dtype, dtype, dtype, idtype, head_dim, head_dim,
++            ["maybe_q_block_expanding_offset", "maybe_kv_block_expanding_offset"],
++            [dtype_map_for_idtype(idtype), dtype_map_for_idtype(idtype)],
++            ["sm_scale", "dllm_block_size"], ["double", "int64_t"],
++            variant_name, variant_decl,
++        ]
++        jit_kwargs = {
++            "pos_encoding_mode": 0, "use_sliding_window": False,
++            "use_logits_soft_cap": False, "use_fp16_qk_reduction": False,
++            "mask_modes": [0, 1, 2, 3, 4],
++        }
++        
++        self._inner_wrapper = BatchPrefillWithPagedKVCacheWrapper(
++            self._float_workspace_buffer, kv_layout=self._kv_layout,
++            use_cuda_graph=self._use_cuda_graph, qo_indptr_buf=self._qo_indptr_buf,
++            paged_kv_indptr_buf=self._paged_kv_indptr_buf,
++            paged_kv_indices_buf=self._paged_kv_indices_buf,
++            paged_kv_last_page_len_buf=self._paged_kv_last_page_len_buf,
++            backend=self._backend, jit_args=jit_args, jit_kwargs=jit_kwargs,
++        )
++        self._dtype = dtype
++        self._head_dim = head_dim
++        self._idtype = idtype
++    
++    def plan(
++        self, qo_indptr: torch.Tensor, paged_kv_indptr: torch.Tensor,
++        paged_kv_indices: torch.Tensor, paged_kv_last_page_len: torch.Tensor,
++        num_qo_heads: int, num_kv_heads: int, head_dim: int, page_size: int,
++        q_data_type: torch.dtype = torch.float16, sm_scale: Optional[float] = None,
++        q_offsets: Optional[torch.Tensor] = None, kv_offsets: Optional[torch.Tensor] = None,
++    ) -> None:
++        if self._inner_wrapper is None or self._head_dim != head_dim or self._dtype != q_data_type or self._idtype != qo_indptr.dtype:
++            self._create_inner_wrapper(q_data_type, head_dim, qo_indptr.dtype)
++        
++        self._sm_scale = sm_scale if sm_scale is not None else 1.0 / math.sqrt(head_dim)
++        
++        if self._use_cuda_graph:
++            if q_offsets is not None:
++                if self._q_offsets_buf is None:
++                    raise ValueError("q_offsets_buf must be provided in CUDA Graph mode")
++                self._q_offsets_buf[:len(q_offsets)].copy_(q_offsets, non_blocking=True)
++                self._q_offsets = self._q_offsets_buf[:len(q_offsets)]
++            else:
++                self._q_offsets = None
++            
++            if kv_offsets is not None:
++                if self._kv_offsets_buf is None:
++                    raise ValueError("kv_offsets_buf must be provided in CUDA Graph mode")
++                self._kv_offsets_buf[:len(kv_offsets)].copy_(kv_offsets, non_blocking=True)
++                self._kv_offsets = self._kv_offsets_buf[:len(kv_offsets)]
++            else:
++                self._kv_offsets = None
++        else:
++            self._q_offsets = q_offsets
++            self._kv_offsets = kv_offsets
++        
++        self._inner_wrapper.plan(
++            qo_indptr=qo_indptr, paged_kv_indptr=paged_kv_indptr,
++            paged_kv_indices=paged_kv_indices, paged_kv_last_page_len=paged_kv_last_page_len,
++            num_qo_heads=num_qo_heads, num_kv_heads=num_kv_heads,
++            head_dim_qk=head_dim, head_dim_vo=head_dim, page_size=page_size,
++            causal=False, pos_encoding_mode="NONE",
++            q_data_type=q_data_type, mask_mode=MaskMode.BLOCK_EXPANDING.value,
++        )
++    
++    def run(
++        self, q: torch.Tensor, paged_kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
++        sm_scale: Optional[float] = None, return_lse: bool = False,
++    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
++        assert self._inner_wrapper is not None, "Must call plan() before run()"
++        effective_sm_scale = sm_scale if sm_scale is not None else self._sm_scale
++        return self._inner_wrapper.run(
++            q, paged_kv_cache, self._q_offsets, self._kv_offsets,
++            effective_sm_scale, self._dllm_block_size, return_lse=return_lse,
++        )
++    
++    @property
++    def dllm_block_size(self) -> int:
++        return self._dllm_block_size
++
++
++def dtype_map_for_idtype(idtype: torch.dtype) -> str:
++    return {torch.int32: "int32_t", torch.int64: "int64_t"}.get(idtype, "int32_t")
++
++
++class BatchBlockExtendRaggedOffsetWrapper:
++    """Batch Block Extend Ragged Attention with Offset Support"""
++    
++    @flashinfer_api
++    def __init__(
++        self,
++        float_workspace_buffer: torch.Tensor,
++        kv_layout: str = "NHD",
++        dllm_block_size: int = 256,
++        use_cuda_graph: bool = False,
++        qo_indptr_buf: Optional[torch.Tensor] = None,
++        kv_indptr_buf: Optional[torch.Tensor] = None,
++        q_offsets_buf: Optional[torch.Tensor] = None,
++        kv_offsets_buf: Optional[torch.Tensor] = None,
++        backend: str = "auto",
++    ) -> None:
++        assert dllm_block_size > 0 and (dllm_block_size & (dllm_block_size - 1)) == 0, \
++            f"dllm_block_size must be a positive power of 2, got {dllm_block_size}"
++        
++        self._dllm_block_size = dllm_block_size
++        self._kv_layout = kv_layout
++        self._backend = backend
++        self._preferred_backend = backend
++        self._device = float_workspace_buffer.device
++        self._dtype: Optional[torch.dtype] = None
++        self._head_dim: Optional[int] = None
++        self._idtype: Optional[torch.dtype] = None
++        
++        self._float_workspace_buffer = float_workspace_buffer
++        self._use_cuda_graph = use_cuda_graph
++        self._qo_indptr_buf = qo_indptr_buf
++        self._kv_indptr_buf = kv_indptr_buf
++        self._q_offsets_buf = q_offsets_buf
++        self._kv_offsets_buf = kv_offsets_buf
++        
++        self._inner_wrapper: Optional[BatchPrefillWithRaggedKVCacheWrapper] = None
++        self._q_offsets: Optional[torch.Tensor] = None
++        self._kv_offsets: Optional[torch.Tensor] = None
++    
++    def _create_inner_wrapper(self, dtype: torch.dtype, head_dim: int, idtype: torch.dtype = torch.int32) -> None:
++        effective_backend = select_best_backend(head_dim, dtype, self._preferred_backend, self._device)
++        self._backend = effective_backend
++        
++        if self._backend == "fa3":
++            uri = _get_batch_be_module_uri(head_dim, dtype) + "_ragged_offset_fa3"
++            variant_name = "BatchBlockExtendOffsetAttentionFA3"
++            variant_decl = _BATCH_BE_OFFSET_VARIANT_DECL_FA3
++        else:
++            uri = _get_batch_be_module_uri(head_dim, dtype) + "_ragged_offset"
++            variant_name = "BatchBlockExtendOffsetAttention"
++            variant_decl = _BATCH_BE_OFFSET_VARIANT_DECL
++        
++        jit_args = [
++            uri, dtype, dtype, dtype, idtype, head_dim, head_dim,
++            ["maybe_q_block_expanding_offset", "maybe_kv_block_expanding_offset"],
++            [dtype_map_for_idtype(idtype), dtype_map_for_idtype(idtype)],
++            ["sm_scale", "dllm_block_size"], ["double", "int64_t"],
++            variant_name, variant_decl,
++        ]
++        jit_kwargs = {
++            "pos_encoding_mode": 0, "use_sliding_window": False,
++            "use_logits_soft_cap": False, "use_fp16_qk_reduction": False,
++            "mask_modes": [0, 1, 2, 3, 4],
++        }
++        
++        self._inner_wrapper = BatchPrefillWithRaggedKVCacheWrapper(
++            self._float_workspace_buffer, kv_layout=self._kv_layout,
++            use_cuda_graph=self._use_cuda_graph, qo_indptr_buf=self._qo_indptr_buf,
++            kv_indptr_buf=self._kv_indptr_buf, backend=self._backend,
++            jit_args=jit_args, jit_kwargs=jit_kwargs,
++        )
++        self._dtype = dtype
++        self._head_dim = head_dim
++        self._idtype = idtype
++    
++    def plan(
++        self, qo_indptr: torch.Tensor, kv_indptr: torch.Tensor,
++        num_qo_heads: int, num_kv_heads: int, head_dim: int,
++        q_data_type: torch.dtype = torch.float16, sm_scale: Optional[float] = None,
++        q_offsets: Optional[torch.Tensor] = None, kv_offsets: Optional[torch.Tensor] = None,
++    ) -> None:
++        if self._inner_wrapper is None or self._head_dim != head_dim or self._dtype != q_data_type or self._idtype != qo_indptr.dtype:
++            self._create_inner_wrapper(q_data_type, head_dim, qo_indptr.dtype)
++        
++        self._sm_scale = sm_scale if sm_scale is not None else 1.0 / math.sqrt(head_dim)
++        
++        if self._use_cuda_graph:
++            if q_offsets is not None:
++                if self._q_offsets_buf is None:
++                    raise ValueError("q_offsets_buf must be provided in CUDA Graph mode")
++                self._q_offsets_buf[:len(q_offsets)].copy_(q_offsets, non_blocking=True)
++                self._q_offsets = self._q_offsets_buf[:len(q_offsets)]
++            else:
++                self._q_offsets = None
++            
++            if kv_offsets is not None:
++                if self._kv_offsets_buf is None:
++                    raise ValueError("kv_offsets_buf must be provided in CUDA Graph mode")
++                self._kv_offsets_buf[:len(kv_offsets)].copy_(kv_offsets, non_blocking=True)
++                self._kv_offsets = self._kv_offsets_buf[:len(kv_offsets)]
++            else:
++                self._kv_offsets = None
++        else:
++            self._q_offsets = q_offsets
++            self._kv_offsets = kv_offsets
++        
++        self._inner_wrapper.plan(
++            qo_indptr=qo_indptr, kv_indptr=kv_indptr,
++            num_qo_heads=num_qo_heads, num_kv_heads=num_kv_heads,
++            head_dim_qk=head_dim, head_dim_vo=head_dim,
++            causal=False, pos_encoding_mode="NONE",
++            q_data_type=q_data_type, mask_mode=MaskMode.BLOCK_EXPANDING.value,
++        )
++    
++    def run(
++        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
++        sm_scale: Optional[float] = None, return_lse: bool = False,
++    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
++        assert self._inner_wrapper is not None, "Must call plan() before run()"
++        effective_sm_scale = sm_scale if sm_scale is not None else self._sm_scale
++        return self._inner_wrapper.run(
++            q, k, v, self._q_offsets, self._kv_offsets,
++            effective_sm_scale, self._dllm_block_size, return_lse=return_lse,
++        )
++    
++    @property
++    def dllm_block_size(self) -> int:
++        return self._dllm_block_size
++
++
++@flashinfer_api
++def batch_block_extend_cascade(
++    q: torch.Tensor,
++    k_current: torch.Tensor,
++    v_current: torch.Tensor,
++    qo_indptr: torch.Tensor,
++    kv_curr_indptr: torch.Tensor,
++    paged_kv_cache: Optional[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]] = None,
++    paged_kv_indptr: Optional[torch.Tensor] = None,
++    paged_kv_indices: Optional[torch.Tensor] = None,
++    paged_kv_last_page_len: Optional[torch.Tensor] = None,
++    page_size: int = 16,
++    dllm_block_size: int = 256,
++    q_offsets: Optional[torch.Tensor] = None,
++    kv_offsets: Optional[torch.Tensor] = None,
++    workspace_buffer: Optional[torch.Tensor] = None,
++    sm_scale: Optional[float] = None,
++    return_lse: bool = False,
++    backend: str = "auto",
++) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
++    """Batch Block Extend Cascade Attention (Current Chunk + Prefix + Merge State)"""
++    from ..cascade import merge_state
++    
++    assert q.dim() == 3 and k_current.dim() == 3 and v_current.dim() == 3
++    
++    device = q.device
++    head_dim = q.size(-1)
++    num_qo_heads = q.size(1)
++    num_kv_heads = k_current.size(1)
++    batch_size = qo_indptr.size(0) - 1
++    
++    if sm_scale is None:
++        sm_scale = 1.0 / math.sqrt(head_dim)
++    
++    if workspace_buffer is None:
++        workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
++    
++    has_prefix = (
++        paged_kv_cache is not None and paged_kv_indptr is not None and
++        paged_kv_indices is not None and paged_kv_last_page_len is not None and
++        paged_kv_indices.size(0) > 0
++    )
++    
++    if q_offsets is None:
++        if has_prefix:
++            import warnings
++            warnings.warn(
++                "q_offsets is None but prefix exists. Block extend mask may be incorrect "
++                "if prefix length is nonzero. Consider passing explicit q_offsets.",
++                stacklevel=2,
++            )
++        q_offsets = torch.zeros(batch_size, dtype=torch.int32, device=device)
++    if kv_offsets is None:
++        kv_offsets = q_offsets  # safe alias: neither is mutated downstream
++    
++    # Stage 1: Current Chunk (Ragged)
++    current_wrapper = BatchBlockExtendRaggedOffsetWrapper(
++        workspace_buffer, kv_layout="NHD", dllm_block_size=dllm_block_size, backend=backend,
++    )
++    current_wrapper.plan(
++        qo_indptr=qo_indptr, kv_indptr=kv_curr_indptr,
++        num_qo_heads=num_qo_heads, num_kv_heads=num_kv_heads, head_dim=head_dim,
++        q_data_type=q.dtype, sm_scale=sm_scale, q_offsets=q_offsets, kv_offsets=kv_offsets,
++    )
++    
++    if has_prefix:
++        o1, s1 = current_wrapper.run(q, k_current, v_current, return_lse=True)
++    else:
++        return current_wrapper.run(q, k_current, v_current, return_lse=return_lse)
++    
++    # Stage 2: Prefix (Paged)
++    prefix_wrapper = BatchBlockExtendPagedOffsetWrapper(
++        workspace_buffer, kv_layout="NHD", dllm_block_size=dllm_block_size, backend=backend,
++    )
++    prefix_wrapper.plan(
++        qo_indptr=qo_indptr, paged_kv_indptr=paged_kv_indptr,
++        paged_kv_indices=paged_kv_indices, paged_kv_last_page_len=paged_kv_last_page_len,
++        num_qo_heads=num_qo_heads, num_kv_heads=num_kv_heads, head_dim=head_dim,
++        page_size=page_size, q_data_type=q.dtype, sm_scale=sm_scale,
++        q_offsets=q_offsets, kv_offsets=None,
++    )
++    o2, s2 = prefix_wrapper.run(q, paged_kv_cache, return_lse=True)
++    
++    # Stage 3: Merge State
++    o, s = merge_state(o1, s1, o2, s2)
++    return (o, s) if return_lse else o
++
++
++@flashinfer_api
++def sglang_style_cascade_attention(
++    q: torch.Tensor,
++    k_current: torch.Tensor,
++    v_current: torch.Tensor,
++    qo_indptr: torch.Tensor,
++    kv_curr_indptr: torch.Tensor,
++    paged_kv_cache: Optional[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]] = None,
++    paged_kv_indptr: Optional[torch.Tensor] = None,
++    paged_kv_indices: Optional[torch.Tensor] = None,
++    paged_kv_last_page_len: Optional[torch.Tensor] = None,
++    page_size: int = 16,
++    workspace_buffer: Optional[torch.Tensor] = None,
++    sm_scale: Optional[float] = None,
++    return_lse: bool = False,
++    backend: str = "fa2",
++) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
++    """SGLang style Cascade Attention (non-causal current chunk + non-causal prefix + merge)"""
++    from ..cascade import merge_state
++    from ..prefill import BatchPrefillWithRaggedKVCacheWrapper, BatchPrefillWithPagedKVCacheWrapper
++    
++    assert q.dim() == 3 and k_current.dim() == 3 and v_current.dim() == 3
++    
++    device = q.device
++    head_dim = q.size(-1)
++    num_qo_heads = q.size(1)
++    num_kv_heads = k_current.size(1)
++    
++    if sm_scale is None:
++        sm_scale = 1.0 / math.sqrt(head_dim)
++    
++    if workspace_buffer is None:
++        workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
++    
++    has_prefix = (
++        paged_kv_cache is not None and paged_kv_indptr is not None and
++        paged_kv_indices is not None and paged_kv_last_page_len is not None and
++        paged_kv_indices.size(0) > 0
++    )
++    
++    # Stage 1: Current Chunk (Ragged, causal=False)
++    # Non-causal because the current chunk uses full bidirectional attention;
++    # the causal relationship with the prefix is handled by the merge stage.
++    ragged_wrapper = BatchPrefillWithRaggedKVCacheWrapper(workspace_buffer, kv_layout="NHD", backend=backend)
++    ragged_wrapper.plan(
++        qo_indptr=qo_indptr, kv_indptr=kv_curr_indptr,
++        num_qo_heads=num_qo_heads, num_kv_heads=num_kv_heads,
++        head_dim_qk=head_dim, head_dim_vo=head_dim, q_data_type=q.dtype, causal=False,
++    )
++    
++    if has_prefix:
++        o1, s1 = ragged_wrapper.run(q, k_current, v_current, return_lse=True)
++    else:
++        return ragged_wrapper.run(q, k_current, v_current, return_lse=return_lse)
++    
++    # Stage 2: Prefix (Paged, causal=False)
++    paged_wrapper = BatchPrefillWithPagedKVCacheWrapper(workspace_buffer, kv_layout="NHD", backend=backend)
++    paged_wrapper.plan(
++        qo_indptr=qo_indptr, paged_kv_indptr=paged_kv_indptr,
++        paged_kv_indices=paged_kv_indices, paged_kv_last_page_len=paged_kv_last_page_len,
++        num_qo_heads=num_qo_heads, num_kv_heads=num_kv_heads,
++        head_dim_qk=head_dim, head_dim_vo=head_dim, page_size=page_size,
++        q_data_type=q.dtype, causal=False,
++    )
++    o2, s2 = paged_wrapper.run(q, paged_kv_cache, return_lse=True)
++    
++    # Stage 3: Merge State
++    o, s = merge_state(o1, s1, o2, s2)
++    return (o, s) if return_lse else o
+diff --git a/flashinfer/dllm/block_extend.py b/flashinfer/dllm/block_extend.py
+new file mode 100644
+index 0000000000..4f5ff1d494
+--- /dev/null
++++ b/flashinfer/dllm/block_extend.py
+@@ -0,0 +1,425 @@
++"""
++Blockwise Extend Attention with Tile-Level Skip Optimization
++
++Optimization Principle:
++
++Use native MaskMode::kBlockExpanding to trigger kernel's built-in tile-level skip optimization:
++
++1. num_iterations calculation: Precisely calculate KV tiles to iterate based on Block Expanding boundaries
++   kv_valid_end = ((q_tile_end - 1) / dllm_block_size + 1) * dllm_block_size
++   Completely invisible KV tiles are skipped directly, not loaded or computed
++
++2. mask_iteration calculation: Determine the first iteration that needs mask checking
++   kv_fully_visible_end = (q_tile_start / dllm_block_size + 1) * dllm_block_size
++   Tiles before this are fully visible, no per-element check needed
++
++3. Native mask calculation: Use (q_block >= k_block) rule on boundary tiles
++
++Block Extend Mask Rules:
++  mask[q, k] = (q / dllm_block_size) >= (k / dllm_block_size)
++  Bidirectional visibility within the same block, can see previous blocks, cannot see subsequent blocks
++
++Usage:
++    from flashinfer.dllm import block_extend_attention_with_offset
++    o = block_extend_attention_with_offset(q, k, v, dllm_block_size=32)
++"""
++
++import math
++import torch
++from pathlib import Path
++from typing import Optional, Union, Tuple
++
++from ..jit import env as jit_env
++from ..jit.attention import gen_customize_single_prefill_module
++from ..prefill import single_prefill_with_kv_cache_with_jit_module
++from ..utils import MaskMode, is_sm90a_supported
++from ..api_logging import flashinfer_api
++
++BLOCK_EXTEND_V2_WITH_OFFSET_VARIANT_DECL = r"""
++// For incremental Chunk Prefill scenarios:
++//   - Each chunk's Q has global offset q_offset
++//   - Kernel retrieves offset via params.get_q_block_expanding_offset()
++//   - position_mask internally calculates: (q_global_block >= k_block)
++
++struct BlockExtendAttentionV2WithOffset : AttentionVariantBase {
++  static constexpr bool use_softmax = true;
++
++  uint32_t qo_len;
++  uint32_t kv_len;
++  uint32_t window_left;
++  float sm_scale_log2;
++
++  template <typename Params>
++  __device__ __host__ BlockExtendAttentionV2WithOffset(const Params& params, uint32_t batch_idx,
++                                                           uint8_t* smem_ptr) {
++    qo_len = params.get_qo_len(batch_idx);
++    kv_len = params.get_kv_len(batch_idx);
++    sm_scale_log2 = params.sm_scale * math::log2e;
++    window_left = kv_len;  // No sliding window
++  }
++
++  // CUDA kernel natively supports MaskMode::kBlockExpanding:
++  //   - q_offset retrieved via params.get_q_block_expanding_offset(batch_idx)
++  //   - position_mask internally handles: (q_global_block >= k_block)
++  //
++  // Therefore LogitsMask only needs to return true
++
++  REGISTER_LOGITS_MASK(params, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, {
++    return true;  // kernel's position_mask already handles Block Expanding + q_offset logic
++  });
++
++  // No additional logits transformation needed
++  REGISTER_LOGITS_TRANSFORM(params, logits, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, {
++    return logits;
++  });
++};
++"""
++
++def _get_aot_path(uri: str) -> Path:
++    """Get AOT precompiled path (unified interface)"""
++    return jit_env.FLASHINFER_AOT_DIR / uri / f"{uri}.so"
++
++
++def _check_aot_available(uri: str) -> bool:
++    """Check if AOT kernel is available (unified interface)"""
++    import os
++    if os.environ.get("FLASHINFER_FORCE_JIT", "0") == "1":
++        return False
++    return _get_aot_path(uri).exists()
++
++
++def _get_dtype_str(dtype: torch.dtype) -> str:
++    """Get dtype string representation (unified interface)"""
++    _dtype_map = {
++        torch.float16: "fp16",
++        torch.bfloat16: "bf16",
++    }
++    if dtype not in _dtype_map:
++        raise ValueError(
++            f"Unsupported dtype {dtype} for Block Extend Attention. "
++            f"Supported: {list(_dtype_map.keys())}"
++        )
++    return _dtype_map[dtype]
++
++
++def _get_module_uri_with_offset(head_dim: int, dtype: torch.dtype, backend: str) -> str:
++    """Generate unique identifier for with offset module
++    
++    v2: 4 scalar params (sm_scale, dllm_block_size, q_block_expanding_offset,
++                         kv_block_expanding_offset)
++    Old version (without _v2 suffix) only has 3 scalars, will automatically match new URI when recompilation is needed.
++    """
++    return f"block_expanding_{backend}_with_offset_v2_hdim{head_dim}_{_get_dtype_str(dtype)}"
++
++
++_MODULE_CACHE_WITH_OFFSET = {}
++
++# V3 FA3 Variant Definition: Block Expanding Attention for Hopper (SM90) architecture
++
++# FA3 uses different variant interface:
++#   - Constructor receives MainloopParams and BlockCoord
++#   - Requires GetAttentionUpdater() template function
++#   - Access custom parameters via params.additional_params.xxx
++#
++# FA3 kernel natively supports kBlockExpanding, so LogitsTransform only needs to return logits
++
++BLOCK_EXTEND_V3_WITH_OFFSET_VARIANT_DECL = r"""
++// FA3 kernel natively supports MaskMode::kBlockExpanding:
++//   - get_num_kv_tiles(): Precisely calculates KV valid range based on Block Expanding boundaries
++//   - mma_f16(): BLOCK_EXPANDING template parameter controls n_masking_steps and col_limit
++//   - position_mask: (q_global_block >= k_block) && (kv_idx < kv_len)
++//
++// Therefore LogitsTransform only needs to return logits, letting kernel's native mask logic take effect
++
++struct BlockExtendAttentionV3WithOffset : AttentionVariantBase {
++  float sm_scale_log2;
++  template <typename MainloopParams, typename BlockCoord>
++  __device__ __host__ BlockExtendAttentionV3WithOffset(
++      const MainloopParams& params, const BlockCoord& block_coord) {
++    sm_scale_log2 = params.additional_params.sm_scale * math::log2e;
++  }
++  template <int NUM_ROWS_PER_THREAD>
++  __device__ auto GetAttentionUpdater() {
++    return OnlineSoftmax<NUM_ROWS_PER_THREAD, /*WITH_SCALE=*/true>(sm_scale_log2);
++  }
++
++  REGISTER_LOGITS_TRANSFORM(params, logits, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, {
++    return logits;  // kernel's native BLOCK_EXPANDING mask already handles this
++  });
++};
++"""
++
++
++def get_block_extend_module_with_offset(
++    head_dim: int = 128,
++    dtype: torch.dtype = torch.float16,
++    backend: str = "fa2",
++    device: Optional[torch.device] = None,
++):
++    """
++    Get Block Extend Attention module with q_offset/kv_offset support
++    
++    Args:
++        head_dim: Head dimension
++        dtype: Data type
++        backend: "fa2" or "fa3"
++        device: Target CUDA device (default: current CUDA device)
++    
++    Returns:
++        Compiled module
++    
++    Raises:
++        RuntimeError: If backend="fa3" but GPU doesn't support SM90
++    """
++    import os
++    import tvm_ffi
++    
++    if device is None:
++        device = torch.device("cuda")
++    
++    # FA3 requires SM90 support
++    if backend == "fa3" and not is_sm90a_supported(device):
++        raise RuntimeError(
++            "FA3 backend requires SM90 (Hopper) architecture. "
++            "Use backend='fa2' for older architectures."
++        )
++    
++    cache_key = (head_dim, dtype, backend, device)
++    if cache_key in _MODULE_CACHE_WITH_OFFSET:
++        return _MODULE_CACHE_WITH_OFFSET[cache_key]
++    
++    uri = _get_module_uri_with_offset(head_dim, dtype, backend)
++    
++    # AOT mode
++    if _check_aot_available(uri):
++        aot_path = _get_aot_path(uri)
++        module = tvm_ffi.load_module(str(aot_path))
++        _MODULE_CACHE_WITH_OFFSET[cache_key] = module
++        return module
++    
++    # AOT not available, check if JIT is disabled
++    if os.environ.get("FLASHINFER_DISABLE_JIT", "0") == "1":
++        raise RuntimeError(
++            f"JIT compilation is disabled via FLASHINFER_DISABLE_JIT environment variable, "
++            f"but the required AOT module is not found at: {_get_aot_path(uri)}."
++        )
++    
++    # JIT mode
++    if backend == "fa3":
++        variant_name = "BlockExtendAttentionV3WithOffset"
++        variant_decl = BLOCK_EXTEND_V3_WITH_OFFSET_VARIANT_DECL
++    else:
++        variant_name = "BlockExtendAttentionV2WithOffset"
++        variant_decl = BLOCK_EXTEND_V2_WITH_OFFSET_VARIANT_DECL
++    
++    spec = gen_customize_single_prefill_module(
++        backend=backend,
++        uri=uri,
++        dtype_q=dtype,
++        dtype_kv=dtype,
++        dtype_o=dtype,
++        head_dim_qk=head_dim,
++        head_dim_vo=head_dim,
++        additional_tensor_names=[],
++        additional_tensor_dtypes=[],
++        additional_scalar_names=["sm_scale", "dllm_block_size", "q_block_expanding_offset", "kv_block_expanding_offset"],
++        additional_scalar_dtypes=["double", "int64_t", "int64_t", "int64_t"],
++        variant_name=variant_name,
++        variant_decl=variant_decl,
++        mask_modes=[4],  # kBlockExpanding = 4
++    )
++    module = spec.build_and_load()
++    
++    _MODULE_CACHE_WITH_OFFSET[cache_key] = module
++    return module
++
++@flashinfer_api
++def block_extend_attention_with_offset(
++    q: torch.Tensor,
++    k: torch.Tensor,
++    v: torch.Tensor,
++    dllm_block_size: int,
++    q_offset: int = 0,
++    kv_offset: int = 0,
++    sm_scale: Optional[float] = None,
++    return_lse: bool = False,
++    backend: str = "auto",
++) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
++    """
++    Block Extend Attention with Q and KV Offset Support
++    
++    Supports incremental Chunk Prefill and Cascade Current Chunk scenarios.
++    
++    Args:
++        q: Query tensor [qo_len, num_heads, head_dim]
++        k: Key tensor [kv_len, num_heads, head_dim]
++        v: Value tensor [kv_len, num_heads, head_dim]
++        dllm_block_size: DLLM block size (must be power of 2)
++        q_offset: Q's global starting position (default 0)
++        kv_offset: KV's global starting position (default 0)
++        sm_scale: Softmax scale (default 1/sqrt(head_dim))
++        return_lse: Whether to return log-sum-exp
++        backend: "auto" (auto-select), "fa2" or "fa3"
++    
++    Returns:
++        Output tensor [qo_len, num_heads, head_dim]
++    
++    Example:
++        >>> # Incremental chunk prefill
++        >>> o = block_extend_attention_with_offset(
++        ...     q, k_cumul, v_cumul,
++        ...     dllm_block_size=32,
++        ...     q_offset=i * chunk_len,
++        ... )
++        >>> 
++        >>> # Cascade Current Chunk
++        >>> o = block_extend_attention_with_offset(
++        ...     q, k_current, v_current,
++        ...     dllm_block_size=256,
++        ...     q_offset=prefix_len,
++        ...     kv_offset=prefix_len,
++        ... )
++    """
++    assert q.dim() == 3 and k.dim() == 3 and v.dim() == 3, \
++        "q, k, v must be 3D tensors [seq_len, num_heads, head_dim]"
++    assert dllm_block_size > 0 and (dllm_block_size & (dllm_block_size - 1)) == 0, \
++        f"dllm_block_size must be a positive power of 2, got {dllm_block_size}"
++    
++    head_dim = q.size(-1)
++    dtype = q.dtype
++    
++    if sm_scale is None:
++        sm_scale = 1.0 / math.sqrt(head_dim)
++    
++    # backend selection
++    if backend == "auto":
++        backend = "fa3" if is_sm90a_supported(q.device) else "fa2"
++    
++    module = get_block_extend_module_with_offset(head_dim=head_dim, dtype=dtype, backend=backend, device=q.device)
++    
++    return single_prefill_with_kv_cache_with_jit_module(
++        module,
++        q, k, v,
++        sm_scale,
++        dllm_block_size,
++        q_offset,
++        kv_offset,
++        mask_mode=MaskMode.BLOCK_EXPANDING.value,
++        return_lse=return_lse,
++    )
++
++# FA2 Cascade version: Current Chunk (causal=True) + Prefix (causal=False) + merge_state
++# Similar to SGLang's Cascade Attention implementation:
++#   - When chunk_size = dllm_block_size, causal mask ≡ block extend mask
++#   - Uses standard FlashInfer API, no custom_mask needed
++#   - Prefix fully visible (Q's block >= all prefix's blocks)
++@flashinfer_api
++def block_extend_cascade(
++    q: torch.Tensor,
++    k_current: torch.Tensor,
++    v_current: torch.Tensor,
++    k_prefix: Optional[torch.Tensor] = None,
++    v_prefix: Optional[torch.Tensor] = None,
++    dllm_block_size: int = 64,
++    sm_scale: Optional[float] = None,
++    return_lse: bool = False,
++    backend: str = "auto",
++) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
++    """
++    Cascade Block Extend Attention (Single Request)
++    
++    Implements Cascade Attention using native Block Extend mask.
++    
++    Three-stage Cascade:
++    1. Current Chunk: Q attend to K_current/V_current (Block Expanding mask)
++    2. Prefix: Q attend to K_prefix/V_prefix (causal=False, fully visible)
++    3. Merge State: Merge softmax states from both stages
++    
++    Args:
++        q: Query tensor [qo_len, num_heads, head_dim] - Q of current chunk
++        k_current: Key tensor [curr_kv_len, num_kv_heads, head_dim] - K of current chunk
++        v_current: Value tensor [curr_kv_len, num_kv_heads, head_dim] - V of current chunk
++        k_prefix: Key tensor [prefix_len, num_kv_heads, head_dim] - Prefix K (optional)
++        v_prefix: Value tensor [prefix_len, num_kv_heads, head_dim] - Prefix V (optional)
++        dllm_block_size: DLLM block size (must be power of 2)
++        sm_scale: Softmax scale (default 1/sqrt(head_dim))
++        return_lse: Whether to return log-sum-exp
++        backend: Backend selection ("auto", "fa2", "fa3")
++    
++    Returns:
++        If return_lse=False: Output tensor [qo_len, num_heads, head_dim]
++        If return_lse=True: (output, lse) tuple
++    
++    Example:
++        >>> # Incremental chunk prefill
++        >>> # Step 0: Q=[0:64), K=[0:64), V=[0:64)
++        >>> o0 = block_extend_cascade(q0, k0, v0, dllm_block_size=64)
++        >>> 
++        >>> # Step 1: Q=[64:128), K_curr=[64:128), K_prefix=[0:64)
++        >>> o1 = block_extend_cascade(q1, k1, v1, k_prefix=k0, v_prefix=v0, dllm_block_size=64)
++    """
++    from ..cascade import merge_state_in_place
++    from ..prefill import single_prefill_with_kv_cache
++    
++    assert q.dim() == 3 and k_current.dim() == 3 and v_current.dim() == 3, \
++        "q, k_current, v_current must be 3D tensors [seq_len, num_heads, head_dim]"
++    
++    head_dim = q.size(-1)
++    if sm_scale is None:
++        sm_scale = 1.0 / math.sqrt(head_dim)
++    
++    has_prefix = k_prefix is not None or v_prefix is not None
++    if has_prefix:
++        assert k_prefix is not None and v_prefix is not None, \
++            "k_prefix and v_prefix must be both provided or both None"
++    prefix_len = k_prefix.size(0) if has_prefix else 0
++
++    # Stage 1: Current Chunk (Block Expanding mask)
++    #
++    # Use native Block Expanding mask with offset support:
++    #   - q_offset = prefix_len: Q's global position starts from prefix_len
++    #   - kv_offset = prefix_len: K_current's global position also starts from prefix_len
++    #   - mask[q, k] = ((q_offset + q_idx) / B) >= ((kv_offset + kv_idx) / B)
++    #
++    # Return directly when no prefix, force return_lse=True when prefix exists for merge
++    if not has_prefix:
++        return block_extend_attention_with_offset(
++            q, k_current, v_current,
++            dllm_block_size=dllm_block_size,
++            q_offset=prefix_len,  # = 0
++            kv_offset=prefix_len,  # = 0
++            sm_scale=sm_scale,
++            return_lse=return_lse,
++            backend=backend,
++        )
++    
++    o1, s1 = block_extend_attention_with_offset(
++        q, k_current, v_current,
++        dllm_block_size=dllm_block_size,
++        q_offset=prefix_len,
++        kv_offset=prefix_len,
++        sm_scale=sm_scale,
++        return_lse=True,  # merge requires lse
++        backend=backend,
++    )
++
++    # Stage 2: Prefix (causal=False, fully visible)
++    #
++    # Q's global position >= prefix's end position, so:
++    #   - Q_block >= all prefix's K_block (since q_offset = prefix_len)
++    #   - Block Expanding mask is all 1 for prefix, equivalent to causal=False
++    #
++    o2, s2 = single_prefill_with_kv_cache(
++        q, k_prefix, v_prefix,
++        causal=False,  # prefix fully visible
++        sm_scale=sm_scale,
++        return_lse=True,
++    )
++
++    # Stage 3: Merge State (in-place merge)
++    merge_state_in_place(o1, s1, o2, s2)
++    
++    if return_lse:
++        return o1, s1
++    else:
++        return o1
+diff --git a/flashinfer/jit/attention/modules.py b/flashinfer/jit/attention/modules.py
+index 879e9024ac..66ed2b5f31 100755
+--- a/flashinfer/jit/attention/modules.py
++++ b/flashinfer/jit/attention/modules.py
+@@ -1309,6 +1309,7 @@ def gen_customize_single_prefill_module(
+     use_logits_soft_cap: bool = False,
+     use_fp16_qk_reduction: bool = False,
+     fp8_enabled: bool = False,
++    mask_modes: Optional[List[int]] = None,
+ ) -> JitSpec:
+     kwargs = {
+         "variant_decl": variant_decl,
+@@ -1350,6 +1351,7 @@ def gen_customize_single_prefill_module(
+             "additional_func_params": additional_func_params,
+             "additional_params_decl": additional_params_decl,
+             "additional_params_setter": additional_params_setter,
++            "has_q_block_expanding_offset": "q_block_expanding_offset" in additional_scalar_names,
+         }
+ 
+         generated_inc_str = config_templ.render(
+@@ -1358,7 +1360,8 @@ def gen_customize_single_prefill_module(
+         os.makedirs(gen_directory, exist_ok=True)
+ 
+         source_paths = []
+-        for mask_mode in [0, 1, 2, 3]:
++        _mask_modes = mask_modes if mask_modes is not None else [0, 1, 2, 3]
++        for mask_mode in _mask_modes:
+             filename = f"single_prefill_kernel_mask_{mask_mode}.cu"
+             dest_path = gen_directory / filename
+             source_paths.append(dest_path)
+@@ -1426,7 +1429,8 @@ def gen_customize_single_prefill_module(
+         os.makedirs(gen_directory, exist_ok=True)
+ 
+         source_paths = []
+-        for mask_mode in [0, 1, 2, 3]:
++        _mask_modes = mask_modes if mask_modes is not None else [0, 1, 2, 3]
++        for mask_mode in _mask_modes:
+             filename = f"single_prefill_sm90_kernel_mask_{mask_mode}.cu"
+             dest_path = gen_directory / filename
+             source_paths.append(dest_path)
+@@ -1562,6 +1566,7 @@ def gen_customize_batch_prefill_module(
+     use_logits_soft_cap: bool = False,
+     use_fp16_qk_reduction: bool = False,
+     fp8_enabled: bool = False,
++    mask_modes: Optional[List[int]] = None,
+ ) -> JitSpec:
+     kwargs = {
+         "variant_decl": variant_decl,
+@@ -1617,7 +1622,8 @@ def gen_customize_batch_prefill_module(
+         os.makedirs(gen_directory, exist_ok=True)
+ 
+         source_paths = []
+-        for mask_mode in [0, 1, 2, 3]:
++        _mask_modes = mask_modes if mask_modes is not None else [0, 1, 2, 3]
++        for mask_mode in _mask_modes:
+             dest_path = (
+                 gen_directory / f"batch_prefill_paged_kernel_mask_{mask_mode}.cu"
+             )
+@@ -1695,7 +1701,8 @@ def gen_customize_batch_prefill_module(
+         generated_inc_str = config_templ.render(**kwargs)
+ 
+         source_paths = []
+-        for mask_mode in [0, 1, 2, 3]:
++        _mask_modes = mask_modes if mask_modes is not None else [0, 1, 2, 3]
++        for mask_mode in _mask_modes:
+             filename = f"batch_prefill_paged_sm90_kernel_mask_{mask_mode}.cu"
+             dest_path = gen_directory / filename
+             source_paths.append(dest_path)
+diff --git a/flashinfer/jit/utils.py b/flashinfer/jit/utils.py
+index befd37d867..f0fa009c04 100644
+--- a/flashinfer/jit/utils.py
++++ b/flashinfer/jit/utils.py
+@@ -92,4 +92,5 @@ def write_if_different(path: pathlib.Path, content: str) -> None:
+     1: "MaskMode::kCausal",
+     2: "MaskMode::kCustom",
+     3: "MaskMode::kMultiItemScoring",
++    4: "MaskMode::kBlockExpanding",
+ }
+diff --git a/flashinfer/prefill.py b/flashinfer/prefill.py
+index 5a45a22db4..93dd661393 100755
+--- a/flashinfer/prefill.py
++++ b/flashinfer/prefill.py
+@@ -188,6 +188,7 @@ def get_customize_batch_prefill_module(
+     use_logits_soft_cap: bool = False,
+     use_fp16_qk_reduction: bool = False,
+     fp8_enabled: bool = False,
++    mask_modes: Optional[List[int]] = None,
+ ):
+     return gen_customize_batch_prefill_module(
+         backend,
+@@ -209,6 +210,7 @@ def get_customize_batch_prefill_module(
+         use_logits_soft_cap,
+         use_fp16_qk_reduction,
+         fp8_enabled,
++        mask_modes,
+     ).build_and_load()
+ 
+ 
+@@ -1732,6 +1734,7 @@ def __init__(
+         self._seq_lens_kv = None
+         self._seq_lens_q = None
+         self._block_tables = None
++        self._mask_mode = None
+ 
+     @property
+     def is_cuda_graph_enabled(self) -> bool:
+@@ -1798,6 +1801,7 @@ def plan(
+         max_sequence_kv: Optional[int] = None,
+         fixed_split_size: Optional[int] = None,
+         disable_split_kv: bool = False,
++        mask_mode: Optional[int] = None,
+     ) -> None:
+         r"""Plan batch prefill/append attention on Paged KV-Cache for given problem specification.
+ 
+@@ -2165,6 +2169,7 @@ def plan(
+         self._rope_theta = rope_theta
+         self._seq_lens_kv = seq_lens
+         self._seq_lens_q = seq_lens_q if seq_lens_q is not None else seq_lens
++        self._mask_mode = mask_mode
+ 
+     begin_forward = plan
+ 
+@@ -2444,6 +2449,8 @@ def run(
+ 
+         if self._custom_mask_buf is not None:
+             mask_mode = MaskMode.CUSTOM.value
++        elif self._mask_mode is not None:
++            mask_mode = self._mask_mode
+         else:
+             if self._causal:
+                 mask_mode = MaskMode.CAUSAL.value
+@@ -2838,6 +2845,7 @@ def __init__(
+         self._max_total_num_rows: Optional[int] = None
+         self._backend = backend
+         self._cached_module = None
++        self._mask_mode = None
+ 
+     @property
+     def is_cuda_graph_enabled(self) -> bool:
+@@ -2896,6 +2904,7 @@ def plan(
+         max_item_len_ptr: Optional[torch.Tensor] = None,
+         fixed_split_size: Optional[int] = None,
+         disable_split_kv: bool = False,
++        mask_mode:Optional[int] = None,
+         seq_lens: Optional[torch.Tensor] = None,
+         seq_lens_q: Optional[torch.Tensor] = None,
+         max_token_per_sequence: Optional[int] = None,
+@@ -3252,6 +3261,7 @@ def plan(
+         self._sm_scale = sm_scale
+         self._rope_scale = rope_scale
+         self._rope_theta = rope_theta
++        self._mask_mode = mask_mode
+ 
+     begin_forward = plan
+ 
+@@ -3532,6 +3542,8 @@ def run(
+ 
+         if self._custom_mask_buf is not None:
+             mask_mode = MaskMode.CUSTOM.value
++        elif self._mask_mode is not None:
++            mask_mode = self._mask_mode
+         else:
+             if self._causal:
+                 mask_mode = MaskMode.CAUSAL.value
+diff --git a/flashinfer/utils.py b/flashinfer/utils.py
+index b1cfeba125..81f2a7eb8a 100644
+--- a/flashinfer/utils.py
++++ b/flashinfer/utils.py
+@@ -40,6 +40,7 @@ class MaskMode(Enum):
+     CAUSAL = 1
+     CUSTOM = 2
+     MULTIITEMSCORING = 3
++    BLOCK_EXPANDING = 4
+ 
+ 
+ class TensorLayout(Enum):
+diff --git a/include/flashinfer/attention/block_expanding_prefill.cuh b/include/flashinfer/attention/block_expanding_prefill.cuh
+new file mode 100644
+index 0000000000..6140c87c98
+--- /dev/null
++++ b/include/flashinfer/attention/block_expanding_prefill.cuh
+@@ -0,0 +1,71 @@
++/*
++ * Copyright (c) 2023-2024 by FlashInfer team.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef FLASHINFER_ATTENTION_BLOCK_EXPANDING_PREFILL_CUH_
++#define FLASHINFER_ATTENTION_BLOCK_EXPANDING_PREFILL_CUH_
++
++#include <cuda_runtime.h>
++#include "../math.cuh"
++
++namespace flashinfer {
++
++// Block Expanding Mask: mask[q, k] = (q / B) >= (k / B)
++// For Q tile [q_start, q_end), visible KV range: [0, ceil(q_end / B) * B)
++
++
++__device__ __forceinline__ uint32_t block_expanding_kv_valid_end(
++    uint32_t q_tile_end, uint32_t dllm_block_size, uint32_t q_offset = 0) {
++  uint32_t q_global_last_idx = q_offset + q_tile_end - 1;
++  uint32_t q_block_id = q_global_last_idx / dllm_block_size;
++  return (q_block_id + 1) * dllm_block_size;
++}
++
++__device__ __forceinline__ uint32_t block_expanding_num_iterations(
++    uint32_t q_tile_end, uint32_t chunk_start, uint32_t chunk_size,
++    uint32_t dllm_block_size, uint32_t CTA_TILE_KV, uint32_t q_offset = 0) {
++  uint32_t kv_valid_end = block_expanding_kv_valid_end(q_tile_end, dllm_block_size, q_offset);
++  uint32_t effective_chunk_size;
++  if (kv_valid_end <= chunk_start) {
++    effective_chunk_size = 0;
++  } else {
++    effective_chunk_size = min(chunk_size, kv_valid_end - chunk_start);
++  }
++  return (effective_chunk_size + CTA_TILE_KV - 1) / CTA_TILE_KV;
++}
++
++__device__ __forceinline__ uint32_t block_expanding_mask_iteration(
++    uint32_t q_tile_start, uint32_t chunk_start, uint32_t chunk_size,
++    uint32_t dllm_block_size, uint32_t CTA_TILE_KV, uint32_t q_offset = 0, uint32_t kv_offset = 0) {
++  uint32_t q_global_start = q_offset + q_tile_start;
++  uint32_t q_first_block_id = q_global_start / dllm_block_size;
++  // Consider kv_offset: kv_global < (q_block + 1) * B
++  // kv_offset + kv_local < (q_block + 1) * B
++  // kv_local < (q_block + 1) * B - kv_offset
++  int64_t max_kv_global = (int64_t)(q_first_block_id + 1) * dllm_block_size;
++  int64_t kv_fully_visible_end_local = max_kv_global - (int64_t)kv_offset;
++  uint32_t kv_fully_visible_end = (kv_fully_visible_end_local > 0) ? (uint32_t)kv_fully_visible_end_local : 0;
++  uint32_t kv_fully_visible_in_chunk;
++  if (kv_fully_visible_end <= chunk_start) {
++    kv_fully_visible_in_chunk = 0;
++  } else {
++    kv_fully_visible_in_chunk = min(chunk_size, kv_fully_visible_end - chunk_start);
++  }
++  return kv_fully_visible_in_chunk / CTA_TILE_KV;
++}
++
++}  // namespace flashinfer
++
++#endif  // FLASHINFER_ATTENTION_BLOCK_EXPANDING_PREFILL_CUH_
+diff --git a/include/flashinfer/attention/default_prefill_params.cuh b/include/flashinfer/attention/default_prefill_params.cuh
+index 2e857fcc72..e8b1dae661 100644
+--- a/include/flashinfer/attention/default_prefill_params.cuh
++++ b/include/flashinfer/attention/default_prefill_params.cuh
+@@ -57,6 +57,9 @@ struct SinglePrefillParams {
+   float rope_rcp_theta;
+ 
+   uint32_t partition_kv;
++  uint32_t dllm_block_size;  // DLLM block size for BlockExpanding mask (0 = disabled)
++  uint32_t q_block_expanding_offset;  // Q global offset (for incremental chunk prefill)
++  uint32_t kv_block_expanding_offset; // KV global offset (for Cascade Current Chunk)
+ 
+   __host__ SinglePrefillParams()
+       : q(nullptr),
+@@ -83,7 +86,10 @@ struct SinglePrefillParams {
+         sm_scale(0.0f),
+         rope_rcp_scale(0.0f),
+         rope_rcp_theta(0.0f),
+-        partition_kv(false) {}
++        partition_kv(false),
++        dllm_block_size(0),
++        q_block_expanding_offset(0),
++        kv_block_expanding_offset(0) {}
+ 
+   __host__ SinglePrefillParams(DTypeQ* q, DTypeKV* k, DTypeKV* v, uint8_t* maybe_custom_mask,
+                                DTypeO* o, float* lse, float* maybe_alibi_slopes,
+@@ -116,7 +122,10 @@ struct SinglePrefillParams {
+         sm_scale(sm_scale),
+         rope_rcp_scale(1. / rope_scale),
+         rope_rcp_theta(1. / rope_theta),
+-        partition_kv(false) {}
++        partition_kv(false),
++        dllm_block_size(0),
++        q_block_expanding_offset(0),
++        kv_block_expanding_offset(0) {}
+ 
+   __host__ __device__ __forceinline__ uint32_t get_qo_len(uint32_t batch_idx) const {
+     return qo_len;
+@@ -125,6 +134,16 @@ struct SinglePrefillParams {
+   __host__ __device__ __forceinline__ uint32_t get_kv_len(uint32_t batch_idx) const {
+     return kv_len;
+   }
++
++  // Single prefill supports incremental chunk prefill
++  __host__ __device__ __forceinline__ uint32_t get_q_block_expanding_offset(uint32_t batch_idx) const {
++    return q_block_expanding_offset;
++  }
++
++  // Single prefill supports Cascade Current Chunk
++  __host__ __device__ __forceinline__ uint32_t get_kv_block_expanding_offset(uint32_t batch_idx) const {
++    return kv_block_expanding_offset;
++  }
+ };
+ 
+ template <typename DTypeQ_, typename DTypeKV_, typename DTypeO_, typename IdType_>
+@@ -177,6 +196,11 @@ struct BatchPrefillRaggedParams {
+   uint32_t token_pos_in_items_len;
+   uint16_t* maybe_max_item_len_ptr;
+ 
++  // Block Expanding mask supports incremental chunk prefill
++  uint32_t dllm_block_size;                    // DLLM block size (0 = disabled)
++  IdType* maybe_q_block_expanding_offset;      // Q global offset (one value per batch item)
++  IdType* maybe_kv_block_expanding_offset;     // KV global offset (one value per batch item, for Cascade Current Chunk)
++
+   __host__ BatchPrefillRaggedParams()
+       : q(nullptr),
+         k(nullptr),
+@@ -218,7 +242,10 @@ struct BatchPrefillRaggedParams {
+         maybe_prefix_len_ptr(nullptr),
+         maybe_token_pos_in_items_ptr(nullptr),
+         token_pos_in_items_len(0),
+-        maybe_max_item_len_ptr(nullptr) {}
++        maybe_max_item_len_ptr(nullptr),
++        dllm_block_size(0),
++        maybe_q_block_expanding_offset(nullptr),
++        maybe_kv_block_expanding_offset(nullptr) {}
+ 
+   __host__ BatchPrefillRaggedParams(DTypeQ* q, DTypeKV* k, DTypeKV* v, uint8_t* maybe_custom_mask,
+                                     IdType* q_indptr, IdType* kv_indptr, IdType* maybe_mask_indptr,
+@@ -269,7 +296,10 @@ struct BatchPrefillRaggedParams {
+         maybe_prefix_len_ptr(nullptr),
+         maybe_token_pos_in_items_ptr(nullptr),
+         token_pos_in_items_len(0),
+-        maybe_max_item_len_ptr(nullptr) {}
++        maybe_max_item_len_ptr(nullptr),
++        dllm_block_size(0),
++        maybe_q_block_expanding_offset(nullptr),
++        maybe_kv_block_expanding_offset(nullptr) {}
+ 
+   __host__ __device__ __forceinline__ uint32_t get_qo_len(uint32_t batch_idx) const {
+     return q_indptr[batch_idx + 1] - q_indptr[batch_idx];
+@@ -278,6 +308,16 @@ struct BatchPrefillRaggedParams {
+   __host__ __device__ __forceinline__ uint32_t get_kv_len(uint32_t batch_idx) const {
+     return kv_indptr[batch_idx + 1] - kv_indptr[batch_idx];
+   }
++
++  // Get batch item's Q global offset (for incremental chunk prefill)
++  __host__ __device__ __forceinline__ uint32_t get_q_block_expanding_offset(uint32_t batch_idx) const {
++    return (maybe_q_block_expanding_offset != nullptr) ? maybe_q_block_expanding_offset[batch_idx] : 0;
++  }
++
++  // Get batch item's KV global offset (for Cascade Current Chunk)
++  __host__ __device__ __forceinline__ uint32_t get_kv_block_expanding_offset(uint32_t batch_idx) const {
++    return (maybe_kv_block_expanding_offset != nullptr) ? maybe_kv_block_expanding_offset[batch_idx] : 0;
++  }
+ };
+ 
+ template <typename DTypeQ_, typename DTypeKV_, typename DTypeO_, typename IdType_>
+@@ -322,6 +362,11 @@ struct BatchPrefillPagedParams {
+   uint32_t token_pos_in_items_len;
+   uint16_t* maybe_max_item_len_ptr;
+ 
++  // Block Expanding mask supports incremental chunk prefill
++  uint32_t dllm_block_size;                    // DLLM block size (0 = disabled)
++  IdType* maybe_q_block_expanding_offset;      // Q global offset (one value per batch item)
++  IdType* maybe_kv_block_expanding_offset;     // KV global offset (one value per batch item, for Cascade Current Chunk)
++
+   __host__ BatchPrefillPagedParams()
+       : q(nullptr),
+         paged_kv(),
+@@ -355,7 +400,10 @@ struct BatchPrefillPagedParams {
+         maybe_prefix_len_ptr(nullptr),
+         maybe_token_pos_in_items_ptr(nullptr),
+         token_pos_in_items_len(0),
+-        maybe_max_item_len_ptr(nullptr) {}
++        maybe_max_item_len_ptr(nullptr),
++        dllm_block_size(0),
++        maybe_q_block_expanding_offset(nullptr),
++        maybe_kv_block_expanding_offset(nullptr) {}
+ 
+   __host__ BatchPrefillPagedParams(DTypeQ* q, paged_kv_t<DTypeKV, IdType> paged_kv,
+                                    uint8_t* maybe_custom_mask, IdType* q_indptr,
+@@ -396,7 +444,10 @@ struct BatchPrefillPagedParams {
+         maybe_prefix_len_ptr(nullptr),
+         maybe_token_pos_in_items_ptr(nullptr),
+         token_pos_in_items_len(0),
+-        maybe_max_item_len_ptr(nullptr) {}
++        maybe_max_item_len_ptr(nullptr),
++        dllm_block_size(0),
++        maybe_q_block_expanding_offset(nullptr),
++        maybe_kv_block_expanding_offset(nullptr) {}
+ 
+   __host__ __device__ __forceinline__ uint32_t get_qo_len(uint32_t batch_idx) const {
+     return q_indptr[batch_idx + 1] - q_indptr[batch_idx];
+@@ -405,6 +456,16 @@ struct BatchPrefillPagedParams {
+   __host__ __device__ __forceinline__ uint32_t get_kv_len(uint32_t batch_idx) const {
+     return paged_kv.get_length(batch_idx);
+   }
++
++  // Get batch item's Q global offset (for incremental chunk prefill)
++  __host__ __device__ __forceinline__ uint32_t get_q_block_expanding_offset(uint32_t batch_idx) const {
++    return (maybe_q_block_expanding_offset != nullptr) ? maybe_q_block_expanding_offset[batch_idx] : 0;
++  }
++
++  // Get batch item's KV global offset (for Cascade Current Chunk)
++  __host__ __device__ __forceinline__ uint32_t get_kv_block_expanding_offset(uint32_t batch_idx) const {
++    return (maybe_kv_block_expanding_offset != nullptr) ? maybe_kv_block_expanding_offset[batch_idx] : 0;
++  }
+ };
+ 
+ }  // namespace flashinfer
+diff --git a/include/flashinfer/attention/hopper/mainloop.cuh b/include/flashinfer/attention/hopper/mainloop.cuh
+index e5bf4ffb9f..5b97b1a93e 100644
+--- a/include/flashinfer/attention/hopper/mainloop.cuh
++++ b/include/flashinfer/attention/hopper/mainloop.cuh
+@@ -24,7 +24,7 @@ namespace flashinfer {
+ 
+ using namespace cute;
+ 
+-template <typename AdditionalParams, typename Ktraits, bool CAUSAL>
++template <typename AdditionalParams, typename Ktraits, bool CAUSAL, bool BLOCK_EXPANDING = false>
+ struct CollectiveMainloop {
+   using DTypeQ = typename Ktraits::DTypeQ;
+   using DTypeKV = typename Ktraits::DTypeKV;
+@@ -139,7 +139,7 @@ struct CollectiveMainloop {
+ 
+   CUTLASS_DEVICE
+   int get_num_kv_tiles(Params const& mainloop_params, int q_tile_idx, const int qo_len,
+-                       const int kv_len) {
++                       const int kv_len, const int batch_idx = 0) {
+     static constexpr int CTA_Q = get<0>(TileShape_QKD{});
+     static constexpr int CTA_KV = get<1>(TileShape_QKD{});
+     int num_kv_tiles = cute::ceil_div(kv_len, CTA_KV);
+@@ -147,6 +147,43 @@ struct CollectiveMainloop {
+       num_kv_tiles = std::min(num_kv_tiles,
+                               cute::ceil_div((q_tile_idx + 1) * CTA_Q + kv_len - qo_len, CTA_KV));
+     }
++    if constexpr (BLOCK_EXPANDING) {
++      // Block Expanding: Calculate valid KV range based on block boundaries
++      // q_tile_end = min((q_tile_idx + 1) * CTA_Q, qo_len)
++      // q_block = (q_offset + q_tile_end - 1) / B
++      // kv_valid_end = (q_block + 1) * B - kv_offset
++      int64_t dllm_block_size = 1;
++      int64_t q_offset = 0;
++      int64_t kv_offset = 0;  // kv_offset support for Cascade Current Chunk
++      if constexpr (has_dllm_block_size_v<AdditionalParams>) {
++        dllm_block_size = mainloop_params.additional_params.dllm_block_size;
++      }
++      // Prefer reading per-batch offset from maybe_q_block_expanding_offset array
++      if constexpr (has_maybe_q_block_expanding_offset_v<AdditionalParams>) {
++        auto* offset_ptr = mainloop_params.additional_params.maybe_q_block_expanding_offset;
++        if (offset_ptr != nullptr) {
++          q_offset = offset_ptr[batch_idx];
++        }
++      } else if constexpr (has_q_block_expanding_offset_v<AdditionalParams>) {
++        q_offset = mainloop_params.additional_params.q_block_expanding_offset;
++      }
++      // Read kv_offset (for Cascade Current Chunk scenario)
++      if constexpr (has_maybe_kv_block_expanding_offset_v<AdditionalParams>) {
++        auto* offset_ptr = mainloop_params.additional_params.maybe_kv_block_expanding_offset;
++        if (offset_ptr != nullptr) {
++          kv_offset = offset_ptr[batch_idx];
++        }
++      } else if constexpr (has_kv_block_expanding_offset_v<AdditionalParams>) {
++        kv_offset = mainloop_params.additional_params.kv_block_expanding_offset;
++      }
++      int q_tile_end = std::min((q_tile_idx + 1) * CTA_Q, qo_len);
++      int64_t q_global_end = q_offset + q_tile_end - 1;
++      int64_t q_block = q_global_end / dllm_block_size;
++      // Consider kv_offset: max valid kv_idx = (q_block + 1) * B - kv_offset
++      int64_t max_kv_global = (q_block + 1) * dllm_block_size;
++      int kv_valid_end = static_cast<int>(std::max(max_kv_global - kv_offset, int64_t(0)));
++      num_kv_tiles = std::min(num_kv_tiles, cute::ceil_div(std::min(kv_len, kv_valid_end), CTA_KV));
++    }
+ 
+     return num_kv_tiles;
+   }
+@@ -190,7 +227,7 @@ struct CollectiveMainloop {
+         tma_partition(mainloop_params.tma_load_V, _0{}, Layout<_1>{}, group_modes<0, 2>(sV),
+                       group_modes<0, 2>(gV));  // (TMA, k), (TMA, PIPE)
+ 
+-    int num_kv_tiles = get_num_kv_tiles(mainloop_params, q_tile_idx, qo_len, kv_len);
++    int num_kv_tiles = get_num_kv_tiles(mainloop_params, q_tile_idx, qo_len, kv_len, batch_idx);
+     int kv_tile_idx = num_kv_tiles - 1;
+     int swa_begin_kv_tile_idx = 0;
+     if constexpr (LEFT_SLIDING_WINDOW) {
+diff --git a/include/flashinfer/attention/hopper/mainloop_mma.cuh b/include/flashinfer/attention/hopper/mainloop_mma.cuh
+index 27522f3187..5499ffda47 100644
+--- a/include/flashinfer/attention/hopper/mainloop_mma.cuh
++++ b/include/flashinfer/attention/hopper/mainloop_mma.cuh
+@@ -11,12 +11,13 @@
+ #include <cutlass/cutlass.h>
+ #include <cutlass/numeric_conversion.h>
+ #include <cutlass/numeric_types.h>
++#include "../../utils.cuh"
+ 
+ #include "variants.cuh"
+ 
+ namespace flashinfer {
+ 
+-template <typename Ktraits, bool LEFT_SLIDING_WINDOW, bool CAUSAL, bool MULTIITEMSCORING,
++template <typename Ktraits, bool LEFT_SLIDING_WINDOW, bool CAUSAL, bool BLOCK_EXPANDING, bool MULTIITEMSCORING,
+           typename WarpScheduler, typename AttentionVariant, typename Params,
+           typename MainloopPipeline, typename PipelineState, typename SharedStorage,
+           typename FrgTensorO, typename AttentionUpdater>
+@@ -26,7 +27,7 @@ CUTLASS_DEVICE void mma_f16(
+     FrgTensorO& tOrO, AttentionUpdater& attention_updater, int kv_tile_idx_count,
+     int swa_begin_kv_tile_idx, int swa_end_kv_tile_idx, int thread_idx, int work_idx,
+     int q_tile_idx, SharedStorage& shared_storage, const int32_t qo_len, const int32_t kv_len,
+-    const int32_t qo_head_idx, const int32_t kv_head_idx, const uint32_t prefix_len,
++    const int32_t qo_head_idx, const int32_t kv_head_idx, const int32_t batch_idx, const uint32_t prefix_len,
+     uint16_t* token_pos_in_items, const int num_kv_tiles_outside_items_window = 0,
+     const int num_kv_tiles_prefix = 0) {
+   using DTypeQ = typename Ktraits::DTypeQ;
+@@ -95,6 +96,54 @@ CUTLASS_DEVICE void mma_f16(
+   auto col_limit_left = [&](int qo_idx) {
+     return qo_idx + kv_len - qo_len - mainloop_params.window_left;
+   };
++
++    // ════════════════════════════════════════════════════════════════════════════════════
++  // Block Expanding Mask Helper
++  // ════════════════════════════════════════════════════════════════════════════════════
++  //   mask[q, k] = (q_global / B) >= (kv_global / B)
++  //   q_global = q_offset + qo_idx
++  //   kv_global = kv_offset + kv_idx
++  // ════════════════════════════════════════════════════════════════════════════════════
++  int64_t dllm_block_size = 1;
++  int64_t q_block_expanding_offset = 0;
++  int64_t kv_block_expanding_offset = 0;  // kv_offset support for Cascade Current Chunk
++  if constexpr (BLOCK_EXPANDING) {
++    if constexpr (has_dllm_block_size_v<decltype(mainloop_params.additional_params)>) {
++      dllm_block_size = mainloop_params.additional_params.dllm_block_size;
++    }
++    // Prefer reading per-batch offset from maybe_q_block_expanding_offset array
++    // Otherwise fallback to scalar q_block_expanding_offset
++    if constexpr (has_maybe_q_block_expanding_offset_v<decltype(mainloop_params.additional_params)>) {
++      auto* offset_ptr = mainloop_params.additional_params.maybe_q_block_expanding_offset;
++      if (offset_ptr != nullptr) {
++        q_block_expanding_offset = offset_ptr[batch_idx];
++      }
++    } else if constexpr (has_q_block_expanding_offset_v<decltype(mainloop_params.additional_params)>) {
++      q_block_expanding_offset = mainloop_params.additional_params.q_block_expanding_offset;
++    }
++    // Read kv_offset (for Cascade Current Chunk scenario)
++    // Prefer reading per-batch offset from maybe_kv_block_expanding_offset array
++    // Otherwise fallback to scalar kv_block_expanding_offset
++    if constexpr (has_maybe_kv_block_expanding_offset_v<decltype(mainloop_params.additional_params)>) {
++      auto* offset_ptr = mainloop_params.additional_params.maybe_kv_block_expanding_offset;
++      if (offset_ptr != nullptr) {
++        kv_block_expanding_offset = offset_ptr[batch_idx];
++      }
++    } else if constexpr (has_kv_block_expanding_offset_v<decltype(mainloop_params.additional_params)>) {
++      kv_block_expanding_offset = mainloop_params.additional_params.kv_block_expanding_offset;
++    }
++  }
++  auto block_expanding_col_limit = [&](int qo_idx) -> int {
++    // q_block = (q_offset + qo_idx) / B
++    // Consider kv_offset: kv_global = kv_offset + kv_idx < (q_block + 1) * B
++    // So kv_idx < (q_block + 1) * B - kv_offset
++    // Fix: Ensure result is non-negative (return 0 when max_kv_global <= kv_offset)
++    int64_t q_global = q_block_expanding_offset + qo_idx;
++    int64_t q_block = q_global / dllm_block_size;
++    int64_t max_kv_global = (q_block + 1) * dllm_block_size;
++    return static_cast<int>(std::max(max_kv_global - kv_block_expanding_offset, int64_t(0)));
++  };
++
+   auto mask_multi_item_scoring = [&](decltype(tSrS)& tSrS, int i, int qo_idx, int kv_idx) {
+     const uint32_t idx_in_original_seq = qo_idx + kv_len - qo_len;
+     const bool out_of_boundary =
+@@ -150,10 +199,15 @@ CUTLASS_DEVICE void mma_f16(
+     for (int i = 0; i < size(tSrS); ++i) {
+       int qo_idx = get<0>(tScS(i)) + q_tile_idx * CTA_Q;
+       int kv_idx = get<1>(tScS(i)) + kv_tile_idx * CTA_KV;
+-      tSrS(i) = variant.LogitsTransform(mainloop_params, tSrS(i), /*batch_idx=*/0, qo_idx, kv_idx,
++      tSrS(i) = variant.LogitsTransform(mainloop_params, tSrS(i), batch_idx, qo_idx, kv_idx,
+                                         qo_head_idx, kv_head_idx);
+       if constexpr (MULTIITEMSCORING) {
+         mask_multi_item_scoring(tSrS, i, qo_idx, kv_idx);
++      } else if constexpr (BLOCK_EXPANDING) {
++        // Block Expanding Mask: (q_block >= k_block) && (kv_idx < kv_len)
++        if (kv_idx >= std::min(kv_len, block_expanding_col_limit(qo_idx))) {
++          tSrS(i) = AttentionUpdater::fill_value;
++        }
+       } else if constexpr (!CAUSAL) {  // Just masking based on col
+         if (kv_idx >= kv_len) {
+           tSrS(i) = AttentionUpdater::fill_value;
+@@ -176,7 +230,7 @@ CUTLASS_DEVICE void mma_f16(
+                             convert_layout_acc_Aregs<typename Ktraits::TiledMmaPV>(tSrS.layout()));
+ 
+   constexpr int n_masking_steps = MULTIITEMSCORING ? (cute::ceil_div(CTA_Q, CTA_KV) + 1)
+-                                                   : (CAUSAL ? cute::ceil_div(CTA_Q, CTA_KV) : 0);
++                                                   : ((CAUSAL || BLOCK_EXPANDING) ? cute::ceil_div(CTA_Q, CTA_KV) : 0);
+   // masking loops
+   // ziangl@nvidia.com: for multi item scoring, we use this loop only to mask along the diagonal
+ #pragma unroll
+@@ -202,10 +256,15 @@ CUTLASS_DEVICE void mma_f16(
+     for (int i = 0; i < size(tSrS); ++i) {
+       int qo_idx = get<0>(tScS(i)) + q_tile_idx * CTA_Q;
+       int kv_idx = get<1>(tScS(i)) + kv_tile_idx_decrement(kv_tile_idx) * CTA_KV;
+-      tSrS(i) = variant.LogitsTransform(mainloop_params, tSrS(i), /*batch_idx=*/0, qo_idx, kv_idx,
++      tSrS(i) = variant.LogitsTransform(mainloop_params, tSrS(i), batch_idx, qo_idx, kv_idx,
+                                         qo_head_idx, kv_head_idx);
+       if (MULTIITEMSCORING) {
+         mask_multi_item_scoring(tSrS, i, qo_idx, kv_idx);
++      } else if constexpr (BLOCK_EXPANDING) {
++        // Fix: Add kv_len boundary check to be consistent with initial mask logic
++        if (kv_idx >= std::min(kv_len, block_expanding_col_limit(qo_idx))) {
++          tSrS(i) = AttentionUpdater::fill_value;
++        }
+       } else {
+         if (kv_idx >= col_limit_right(qo_idx)) {
+           tSrS(i) = AttentionUpdater::fill_value;
+@@ -248,7 +307,7 @@ CUTLASS_DEVICE void mma_f16(
+     for (int i = 0; i < size(tSrS); ++i) {
+       int qo_idx = get<0>(tScS(i)) + q_tile_idx * CTA_Q;
+       int kv_idx = get<1>(tScS(i)) + kv_tile_idx_decrement(kv_tile_idx) * CTA_KV;
+-      tSrS(i) = variant.LogitsTransform(mainloop_params, tSrS(i), /*batch_idx=*/0, qo_idx, kv_idx,
++      tSrS(i) = variant.LogitsTransform(mainloop_params, tSrS(i), batch_idx, qo_idx, kv_idx,
+                                         qo_head_idx, kv_head_idx);
+     }
+     if constexpr (MULTIITEMSCORING) {
+@@ -294,7 +353,7 @@ CUTLASS_DEVICE void mma_f16(
+       for (int i = 0; i < size(tSrS); ++i) {
+         int qo_idx = get<0>(tScS(i)) + q_tile_idx * CTA_Q;
+         int kv_idx = get<1>(tScS(i)) + (kv_tile_idx - 1) * CTA_KV;
+-        tSrS(i) = variant.LogitsTransform(mainloop_params, tSrS(i), /*batch_idx=*/0, qo_idx, kv_idx,
++        tSrS(i) = variant.LogitsTransform(mainloop_params, tSrS(i), batch_idx, qo_idx, kv_idx,
+                                           qo_head_idx, kv_head_idx);
+         if (kv_idx < col_limit_left(qo_idx)) {
+           tSrS(i) = AttentionUpdater::fill_value;
+diff --git a/include/flashinfer/attention/hopper/prefill_sm90.cuh b/include/flashinfer/attention/hopper/prefill_sm90.cuh
+index f1e441a53b..bc3313809e 100644
+--- a/include/flashinfer/attention/hopper/prefill_sm90.cuh
++++ b/include/flashinfer/attention/hopper/prefill_sm90.cuh
+@@ -41,7 +41,7 @@ DEFINE_HAS_MEMBER(token_pos_in_items_len)
+ DEFINE_HAS_MEMBER(maybe_max_item_len_ptr)
+ 
+ template <typename CollectiveMainloop, typename CollectiveEpilogue, typename Ktraits,
+-          bool LEFT_SLIDING_WINDOW, bool CAUSAL, typename TileScheduler,
++          bool LEFT_SLIDING_WINDOW, bool CAUSAL, bool BLOCK_EXPANDING, typename TileScheduler,
+           bool MULTIITEMSCORING = false>
+ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp, 1)
+     PrefillWithKVCacheKernel(CUTE_GRID_CONSTANT
+@@ -172,7 +172,7 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
+           continue;
+         }
+         int num_kv_tiles =
+-            collective_mainloop.get_num_kv_tiles(mainloop_params, q_tile_idx, qo_len, kv_len);
++            collective_mainloop.get_num_kv_tiles(mainloop_params, q_tile_idx, qo_len, kv_len, batch_idx);
+         if (num_kv_tiles <= 0) {
+           scheduler.prefetch_next_work(scheduler_params, work_tile_info);
+           scheduler.broadcast_next_work(work_tile_info);
+@@ -241,7 +241,7 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
+         continue;
+       }
+       int num_kv_tiles =
+-          collective_mainloop.get_num_kv_tiles(mainloop_params, q_tile_idx, qo_len, kv_len);
++          collective_mainloop.get_num_kv_tiles(mainloop_params, q_tile_idx, qo_len, kv_len, batch_idx);
+       if (num_kv_tiles <= 0) {  // We exit early and write 0 to gO and -inf to gLSE.
+         collective_epilogue.store_zero(epilogue_params, shared_storage,
+                                        threadIdx.x - NUM_COPY_THREADS, block_coord);
+@@ -273,12 +273,12 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
+         num_kv_tiles_outside_items_window = valid_items_window_len / CTA_KV;
+         num_kv_tiles_prefix = cute::ceil_div(prefix_len, CTA_KV);
+       }
+-      mma_f16<Ktraits, /*LEFT_SLIDING_WINDOW=*/LEFT_SLIDING_WINDOW, CAUSAL, MULTIITEMSCORING,
++      mma_f16<Ktraits, /*LEFT_SLIDING_WINDOW=*/LEFT_SLIDING_WINDOW, CAUSAL, BLOCK_EXPANDING, MULTIITEMSCORING,
+               CollectiveMainloop::WarpScheduler>(
+           mainloop_params, variant, pipeline_k, pipeline_v, smem_pipe_read_k, smem_pipe_read_v,
+           tOrO, attention_updater, num_kv_tiles, swa_begin_kv_tile_idx, swa_end_kv_tile_idx,
+           threadIdx.x - NUM_COPY_THREADS, work_idx, q_tile_idx, shared_storage, qo_len, kv_len,
+-          qo_head_idx, kv_head_idx, prefix_len, token_pos_in_items,
++          qo_head_idx, kv_head_idx, batch_idx, prefix_len, token_pos_in_items,
+           num_kv_tiles_outside_items_window, num_kv_tiles_prefix);
+       collective_epilogue.store(epilogue_params, tOrO, attention_updater.get_lse(), shared_storage,
+                                 tiled_mma_pv, threadIdx.x - NUM_COPY_THREADS, block_coord);
+@@ -289,14 +289,14 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
+   }
+ }
+ 
+-template <typename KernelTraits, bool LEFT_SLIDING_WINDOW, bool CAUSAL, typename Params>
++template <typename KernelTraits, bool LEFT_SLIDING_WINDOW, bool CAUSAL, bool BLOCK_EXPANDING, typename Params>
+ cudaError_t SinglePrefillWithKVCacheKernelTraitsDispatched(Params& params, cudaStream_t stream) {
+   using DTypeQ = typename KernelTraits::DTypeQ;
+   using DTypeKV = typename KernelTraits::DTypeKV;
+   using DTypeO = typename KernelTraits::DTypeO;
+ 
+   using CollectiveMainloop =
+-      CollectiveMainloop<typename Params::AdditionalParams, KernelTraits, CAUSAL>;
++      CollectiveMainloop<typename Params::AdditionalParams, KernelTraits, CAUSAL, BLOCK_EXPANDING>;
+   using CollectiveEpilogue = CollectiveEpilogue<KernelTraits>;
+   using Scheduler = SingleTileScheduler;
+   typename CollectiveMainloop::Params mainloop_params = CollectiveMainloop::to_underlying_arguments(
+@@ -332,7 +332,7 @@ cudaError_t SinglePrefillWithKVCacheKernelTraitsDispatched(Params& params, cudaS
+ 
+   auto kernel =
+       (void*)PrefillWithKVCacheKernel<CollectiveMainloop, CollectiveEpilogue, KernelTraits,
+-                                      LEFT_SLIDING_WINDOW, CAUSAL, Scheduler>;
++                                      LEFT_SLIDING_WINDOW, CAUSAL, BLOCK_EXPANDING, Scheduler>;
+   int smem_size = sizeof(typename KernelTraits::SharedStorage);
+   FLASHINFER_CUDA_CALL(
+       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+@@ -351,7 +351,7 @@ cudaError_t SinglePrefillWithKVCacheKernelTraitsDispatched(Params& params, cudaS
+   return cudaSuccess;
+ }
+ 
+-template <typename KernelTraits, bool LEFT_SLIDING_WINDOW, bool CAUSAL,
++template <typename KernelTraits, bool LEFT_SLIDING_WINDOW, bool CAUSAL, bool BLOCK_EXPANDING,
+           bool SAME_SCHEDULE_FOR_ALL_HEADS, typename Params, bool MULTIITEMSCORING = false>
+ cudaError_t BatchPrefillWithPagedKVCacheKernelTraitsDispatched(Params& params,
+                                                                cudaStream_t stream) {
+@@ -361,7 +361,7 @@ cudaError_t BatchPrefillWithPagedKVCacheKernelTraitsDispatched(Params& params,
+   using IdType = typename KernelTraits::IdType;
+ 
+   using CollectiveMainloop = SparseCollectiveMainloop<typename Params::AdditionalParams,
+-                                                      KernelTraits, CAUSAL, MULTIITEMSCORING>;
++                                                      KernelTraits, CAUSAL, BLOCK_EXPANDING, MULTIITEMSCORING>;
+   using CollectiveEpilogue = CollectiveEpilogue<KernelTraits>;
+   using Scheduler =
+       std::conditional_t<SAME_SCHEDULE_FOR_ALL_HEADS, BatchPrefillTileScheduler<IdType>,
+@@ -409,7 +409,8 @@ cudaError_t BatchPrefillWithPagedKVCacheKernelTraitsDispatched(Params& params,
+   // Get the ptr to kernel function.
+   auto kernel =
+       (void*)PrefillWithKVCacheKernel<CollectiveMainloop, CollectiveEpilogue, KernelTraits,
+-                                      LEFT_SLIDING_WINDOW, CAUSAL, Scheduler, MULTIITEMSCORING>;
++                                      LEFT_SLIDING_WINDOW, CAUSAL, BLOCK_EXPANDING, Scheduler,
++                                      MULTIITEMSCORING>;
+   int smem_size = sizeof(typename KernelTraits::SharedStorage);
+   FLASHINFER_CUDA_CALL(
+       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+@@ -428,7 +429,7 @@ cudaError_t BatchPrefillWithPagedKVCacheKernelTraitsDispatched(Params& params,
+   return cudaSuccess;
+ }
+ 
+-template <typename KernelTraits, bool LEFT_SLIDING_WINDOW, bool CAUSAL,
++template <typename KernelTraits, bool LEFT_SLIDING_WINDOW, bool CAUSAL, bool BLOCK_EXPANDING,
+           bool SAME_SCHEDULE_FOR_ALL_HEADS, typename Params>
+ cudaError_t BatchPrefillWithRaggedKVCacheKernelTraitsDispatched(Params& params,
+                                                                 cudaStream_t stream) {
+@@ -438,7 +439,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheKernelTraitsDispatched(Params& params,
+   using IdType = typename KernelTraits::IdType;
+ 
+   using CollectiveMainloop =
+-      CollectiveMainloop<typename Params::AdditionalParams, KernelTraits, CAUSAL>;
++      CollectiveMainloop<typename Params::AdditionalParams, KernelTraits, CAUSAL, BLOCK_EXPANDING>;
+   using CollectiveEpilogue = CollectiveEpilogue<KernelTraits>;
+   using Scheduler =
+       std::conditional_t<SAME_SCHEDULE_FOR_ALL_HEADS, BatchPrefillTileScheduler<IdType>,
+@@ -484,7 +485,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheKernelTraitsDispatched(Params& params,
+   // Get the ptr to kernel function.
+   auto kernel =
+       (void*)PrefillWithKVCacheKernel<CollectiveMainloop, CollectiveEpilogue, KernelTraits,
+-                                      LEFT_SLIDING_WINDOW, CAUSAL, Scheduler>;
++                                      LEFT_SLIDING_WINDOW, CAUSAL, BLOCK_EXPANDING, Scheduler>;
+   int smem_size = sizeof(typename KernelTraits::SharedStorage);
+   FLASHINFER_CUDA_CALL(
+       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+@@ -503,13 +504,13 @@ cudaError_t BatchPrefillWithRaggedKVCacheKernelTraitsDispatched(Params& params,
+   return cudaSuccess;
+ }
+ 
+-template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, bool CAUSAL>
++template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, bool CAUSAL_OR_BLOCK_EXPANDING>
+ constexpr auto getCTATileSize() {
+   if constexpr (HEAD_DIM_QK == HEAD_DIM_VO) {
+     if constexpr (HEAD_DIM_QK == 64) {
+       return std::make_tuple(192, 128);
+     } else if constexpr (HEAD_DIM_QK == 128) {
+-      if constexpr (CAUSAL) {
++      if constexpr (CAUSAL_OR_BLOCK_EXPANDING) {
+         return std::make_tuple(128, 128);
+       } else {
+         return std::make_tuple(128, 192);
+@@ -532,14 +533,15 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params& params, cudaStream_t stre
+     return cudaErrorNotSupported;  // Not supported yet.
+   }
+   constexpr bool CAUSAL = MASK_MODE == MaskMode::kCausal;
+-  constexpr auto CTA_TILE_SIZE = getCTATileSize<HEAD_DIM_QK, HEAD_DIM_VO, CAUSAL>();
++  constexpr bool BLOCK_EXPANDING = MASK_MODE == MaskMode::kBlockExpanding;
++  constexpr auto CTA_TILE_SIZE = getCTATileSize<HEAD_DIM_QK, HEAD_DIM_VO, CAUSAL || BLOCK_EXPANDING>();
+   SinglePrefillWithKVCacheKernelTraitsDispatched<
+       AttentionKernelTraits</*USE_TMA_LOAD_KV=*/true, HEAD_DIM_QK, HEAD_DIM_VO,
+                             /*CTA_Q_=*/get<0>(CTA_TILE_SIZE),
+                             /*CTA_KV_=*/get<1>(CTA_TILE_SIZE),
+                             /*NUM_STAGES_=*/2, typename Params::DTypeQ, typename Params::DTypeKV,
+                             typename Params::DTypeO, typename Params::IdType, AttentionVariant>,
+-      LEFT_SLIDING_WINDOW, CAUSAL>(params, stream);
++      LEFT_SLIDING_WINDOW, CAUSAL, BLOCK_EXPANDING>(params, stream);
+   cudaError_t status = cudaGetLastError();
+   return status;
+ }
+@@ -553,14 +555,15 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params& params, bool enable_
+     return cudaErrorNotSupported;  // Not supported yet.
+   }
+   constexpr bool CAUSAL = MASK_MODE == MaskMode::kCausal;
+-  constexpr auto CTA_TILE_SIZE = getCTATileSize<HEAD_DIM_QK, HEAD_DIM_VO, CAUSAL>();
++  constexpr bool BLOCK_EXPANDING = MASK_MODE == MaskMode::kBlockExpanding;
++  constexpr auto CTA_TILE_SIZE = getCTATileSize<HEAD_DIM_QK, HEAD_DIM_VO, CAUSAL || BLOCK_EXPANDING>();
+   BatchPrefillWithRaggedKVCacheKernelTraitsDispatched<
+       AttentionKernelTraits</*USE_TMA_LOAD_KV=*/true, HEAD_DIM_QK, HEAD_DIM_VO,
+                             /*CTA_Q_=*/get<0>(CTA_TILE_SIZE),
+                             /*CTA_KV_=*/get<1>(CTA_TILE_SIZE),
+                             /*NUM_STAGES_=*/2, typename Params::DTypeQ, typename Params::DTypeKV,
+                             typename Params::DTypeO, typename Params::IdType, AttentionVariant>,
+-      LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS>(params, stream);
++      LEFT_SLIDING_WINDOW, CAUSAL, BLOCK_EXPANDING, SAME_SCHEDULE_FOR_ALL_HEADS>(params, stream);
+   cudaError_t status = cudaGetLastError();
+   return status;
+ }
+@@ -574,6 +577,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params& params, bool enable_p
+     return cudaErrorNotSupported;  // Not supported yet.
+   }
+   constexpr bool CAUSAL = MASK_MODE == MaskMode::kCausal;
++  constexpr bool BLOCK_EXPANDING = MASK_MODE == MaskMode::kBlockExpanding;
+   constexpr bool MULTIITEMSCORING = MASK_MODE == MaskMode::kMultiItemScoring;
+   if constexpr (HEAD_DIM_QK == HEAD_DIM_VO) {
+     if constexpr (HEAD_DIM_VO == 64) {
+@@ -585,7 +589,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params& params, bool enable_p
+                                 /*NUM_STAGES_=*/2, typename Params::DTypeQ,
+                                 typename Params::DTypeKV, typename Params::DTypeO,
+                                 typename Params::IdType, AttentionVariant>,
+-          LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS, Params, MULTIITEMSCORING>(
++          LEFT_SLIDING_WINDOW, CAUSAL, BLOCK_EXPANDING, SAME_SCHEDULE_FOR_ALL_HEADS, Params, MULTIITEMSCORING>(
+           params, stream);
+     } else if constexpr (HEAD_DIM_VO == 128) {
+       BatchPrefillWithPagedKVCacheKernelTraitsDispatched<
+@@ -595,7 +599,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params& params, bool enable_p
+                                 /*NUM_STAGES_=*/2, typename Params::DTypeQ,
+                                 typename Params::DTypeKV, typename Params::DTypeO,
+                                 typename Params::IdType, AttentionVariant>,
+-          LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS, Params, MULTIITEMSCORING>(
++          LEFT_SLIDING_WINDOW, CAUSAL, BLOCK_EXPANDING, SAME_SCHEDULE_FOR_ALL_HEADS, Params, MULTIITEMSCORING>(
+           params, stream);
+     } else {
+       // HEAD_DIM == 256;
+@@ -607,7 +611,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params& params, bool enable_p
+                                 /*NUM_STAGES_=*/2, typename Params::DTypeQ,
+                                 typename Params::DTypeKV, typename Params::DTypeO,
+                                 typename Params::IdType, AttentionVariant>,
+-          LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS, Params, MULTIITEMSCORING>(
++          LEFT_SLIDING_WINDOW, CAUSAL, BLOCK_EXPANDING, SAME_SCHEDULE_FOR_ALL_HEADS, Params, MULTIITEMSCORING>(
+           params, stream);
+     }
+   } else {
+diff --git a/include/flashinfer/attention/hopper/sparse_mainloop.cuh b/include/flashinfer/attention/hopper/sparse_mainloop.cuh
+index 1d9697af4e..ca6828c8be 100644
+--- a/include/flashinfer/attention/hopper/sparse_mainloop.cuh
++++ b/include/flashinfer/attention/hopper/sparse_mainloop.cuh
+@@ -33,7 +33,7 @@ namespace flashinfer {
+ 
+ using namespace cute;
+ 
+-template <typename AdditionalParams, typename Ktraits, bool CAUSAL, bool MULTIITEMSCORING = false>
++template <typename AdditionalParams, typename Ktraits, bool CAUSAL, bool BLOCK_EXPANDING = false, bool MULTIITEMSCORING = false>
+ struct SparseCollectiveMainloop {
+   using DTypeQ = typename Ktraits::DTypeQ;
+   using DTypeKV = typename Ktraits::DTypeKV;
+@@ -157,7 +157,7 @@ struct SparseCollectiveMainloop {
+ 
+   CUTLASS_DEVICE
+   int get_num_kv_tiles(Params const& mainloop_params, int q_tile_idx, const int qo_len,
+-                       const int kv_len) {
++                       const int kv_len, const int batch_idx = 0) {
+     static constexpr int CTA_Q = get<0>(TileShape_QKD{});
+     static constexpr int CTA_KV = get<1>(TileShape_QKD{});
+     int num_kv_tiles = cute::ceil_div(kv_len, CTA_KV);
+@@ -165,6 +165,41 @@ struct SparseCollectiveMainloop {
+       num_kv_tiles = std::min(num_kv_tiles,
+                               cute::ceil_div((q_tile_idx + 1) * CTA_Q + kv_len - qo_len, CTA_KV));
+     }
++    if constexpr (BLOCK_EXPANDING) {
++      // Block Expanding: Calculate valid KV range based on block boundaries
++      int64_t dllm_block_size = 1;
++      int64_t q_offset = 0;
++      int64_t kv_offset = 0;
++      if constexpr (has_dllm_block_size_v<AdditionalParams>) {
++        dllm_block_size = mainloop_params.additional_params.dllm_block_size;
++      }
++      // Prefer reading per-batch offset from maybe_q_block_expanding_offset array
++      if constexpr (has_maybe_q_block_expanding_offset_v<AdditionalParams>) {
++        auto* offset_ptr = mainloop_params.additional_params.maybe_q_block_expanding_offset;
++        if (offset_ptr != nullptr) {
++          q_offset = offset_ptr[batch_idx];
++        }
++      } else if constexpr (has_q_block_expanding_offset_v<AdditionalParams>) {
++        q_offset = mainloop_params.additional_params.q_block_expanding_offset;
++      }
++      // Read kv_offset (for Cascade Current Chunk scenario)
++      if constexpr (has_maybe_kv_block_expanding_offset_v<AdditionalParams>) {
++        auto* offset_ptr = mainloop_params.additional_params.maybe_kv_block_expanding_offset;
++        if (offset_ptr != nullptr) {
++          kv_offset = offset_ptr[batch_idx];
++        }
++      } else if constexpr (has_kv_block_expanding_offset_v<AdditionalParams>) {
++        kv_offset = mainloop_params.additional_params.kv_block_expanding_offset;
++      }
++      int q_tile_end = std::min((q_tile_idx + 1) * CTA_Q, qo_len);
++      int64_t q_global_end = q_offset + q_tile_end - 1;
++      int64_t q_block = q_global_end / dllm_block_size;
++      // Consider kv_offset: max valid kv_idx = (q_block + 1) * B - kv_offset
++      // Ensure kv_valid_end is non-negative (return 0 when max_kv_global <= kv_offset)
++      int64_t max_kv_global = (q_block + 1) * dllm_block_size;
++      int kv_valid_end = static_cast<int>(std::max(max_kv_global - kv_offset, int64_t(0)));
++      num_kv_tiles = std::min(num_kv_tiles, cute::ceil_div(std::min(kv_len, kv_valid_end), CTA_KV));
++    }
+     if constexpr (MULTIITEMSCORING) {
+       num_kv_tiles = std::min(num_kv_tiles,
+                               cute::ceil_div((q_tile_idx + 1) * CTA_Q + kv_len - qo_len, CTA_KV));
+@@ -204,7 +239,7 @@ struct SparseCollectiveMainloop {
+         tma_partition(mainloop_params.tma_load_Q, _0{}, Layout<_1>{}, group_modes<0, 2>(sQ_x),
+                       group_modes<0, 2>(gQ_x));  // (TMA), (TMA)
+ 
+-    int num_kv_tiles = get_num_kv_tiles(mainloop_params, q_tile_idx, qo_len, kv_len);
++    int num_kv_tiles = get_num_kv_tiles(mainloop_params, q_tile_idx, qo_len, kv_len, batch_idx);
+     int kv_tile_idx = num_kv_tiles - 1;
+     int swa_begin_kv_tile_idx = 0;
+     if constexpr (LEFT_SLIDING_WINDOW) {
+diff --git a/include/flashinfer/attention/mask.cuh b/include/flashinfer/attention/mask.cuh
+index 6692b0cf3f..6af1d829d6 100644
+--- a/include/flashinfer/attention/mask.cuh
++++ b/include/flashinfer/attention/mask.cuh
+@@ -23,6 +23,7 @@ enum class MaskMode {
+   kCausal = 1U,  // Causal mask
+   kCustom = 2U,  // Custom mask
+   kMultiItemScoring = 3U,
++  kBlockExpanding = 4U,
+ };
+ 
+ }  // namespace flashinfer
+diff --git a/include/flashinfer/attention/prefill.cuh b/include/flashinfer/attention/prefill.cuh
+index 6185fdeb10..8128ae3bce 100644
+--- a/include/flashinfer/attention/prefill.cuh
++++ b/include/flashinfer/attention/prefill.cuh
+@@ -40,6 +40,7 @@
+ #include "cascade.cuh"
+ #include "mask.cuh"
+ #include "variants.cuh"
++#include "block_expanding_prefill.cuh"
+ namespace flashinfer {
+ 
+ DEFINE_HAS_MEMBER(maybe_q_rope_offset)
+@@ -1105,10 +1106,22 @@ __device__ __forceinline__ void logits_mask(
+                                                                     2 * (lane_idx % 4) +
+                                                                     8 * (reg_id / 4) + reg_id % 2;
+         const uint32_t qo_head_idx = kv_head_idx * group_size + r[mma_q][(reg_id % 4) / 2];
+-        const bool mask =
+-            (!(MASK_MODE == MaskMode::kCausal || MASK_MODE == MaskMode::kMultiItemScoring
+-                   ? (kv_idx + qo_len > kv_len + q_idx || (kv_idx >= chunk_end))
+-                   : kv_idx >= chunk_end)) &&
++        bool position_mask;
++        if constexpr (MASK_MODE == MaskMode::kBlockExpanding) {
++          const uint32_t dllm_block_size = params.dllm_block_size;
++          const uint32_t q_offset = params.get_q_block_expanding_offset(batch_idx);
++          const uint32_t kv_offset = params.get_kv_block_expanding_offset(batch_idx);
++          const uint32_t q_global = q_offset + q_idx;
++          const uint32_t q_block = q_global / dllm_block_size;
++          const uint32_t kv_global = kv_offset + kv_idx;
++          const uint32_t k_block = kv_global / dllm_block_size;
++          position_mask = (q_block >= k_block) && (kv_idx < chunk_end);
++        } else if constexpr (MASK_MODE == MaskMode::kCausal || MASK_MODE == MaskMode::kMultiItemScoring) {
++          position_mask = (kv_idx + qo_len <= kv_len + q_idx) && (kv_idx < chunk_end);
++        } else {
++          position_mask = (kv_idx < chunk_end);
++        }
++        const bool mask = position_mask &&
+             variant.LogitsMask(params, batch_idx, q_idx, kv_idx, qo_head_idx, kv_head_idx);
+         s_frag[mma_q][mma_kv][reg_id] =
+             (mask) ? s_frag[mma_q][mma_kv][reg_id] : (KTraits::MaskFillValue);
+@@ -1812,26 +1825,45 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
+       smem_t<SWIZZLE_MODE_KV> k_smem(smem_storage.k_smem),
+           v_smem(KTraits::USE_KV_SHARED_SMEM ? smem_storage.k_smem : smem_storage.v_smem);
+ 
+-      const uint32_t num_iterations = ceil_div(
+-          MASK_MODE == MaskMode::kCausal
+-              ? min(chunk_size, sub_if_greater_or_zero(
+-                                    kv_len - qo_len + ceil_div(((bx + 1) * CTA_TILE_Q), group_size),
+-                                    chunk_start))
+-              : chunk_size,
+-          CTA_TILE_KV);
++      uint32_t num_iterations;
++      if constexpr (MASK_MODE == MaskMode::kBlockExpanding) {
++        const uint32_t dllm_block_size = params.dllm_block_size;
++        const uint32_t q_tile_end = min(qo_len, ceil_div(((bx + 1) * CTA_TILE_Q), group_size));
++        const uint32_t q_offset = params.get_q_block_expanding_offset(0);  // Single prefill: batch_idx=0
++        num_iterations = block_expanding_num_iterations(
++            q_tile_end, chunk_start, chunk_size, dllm_block_size, CTA_TILE_KV, q_offset);
++      } else if constexpr (MASK_MODE == MaskMode::kCausal) {
++        num_iterations = ceil_div(
++            min(chunk_size,
++                sub_if_greater_or_zero(
++                    kv_len - qo_len + ceil_div(((bx + 1) * CTA_TILE_Q), group_size), chunk_start)),
++            CTA_TILE_KV);
++      } else {
++        num_iterations = ceil_div(chunk_size, CTA_TILE_KV);
++      }
+ 
+       const uint32_t window_iteration =
+           ceil_div(sub_if_greater_or_zero(kv_len + ceil_div((bx + 1) * CTA_TILE_Q, group_size),
+                                           qo_len + window_left + chunk_start),
+                    CTA_TILE_KV);
+ 
+-      const uint32_t mask_iteration =
+-          (MASK_MODE == MaskMode::kCausal
+-               ? min(chunk_size,
+-                     sub_if_greater_or_zero(
+-                         kv_len + ceil_div((bx * CTA_TILE_Q), group_size) - qo_len, chunk_start))
+-               : chunk_size) /
+-          CTA_TILE_KV;
++      uint32_t mask_iteration;
++      if constexpr (MASK_MODE == MaskMode::kBlockExpanding) {
++        const uint32_t dllm_block_size = params.dllm_block_size;
++        const uint32_t q_tile_start = ceil_div((bx * CTA_TILE_Q), group_size);
++        const uint32_t q_offset = params.get_q_block_expanding_offset(0);  // Single prefill: batch_idx=0
++        const uint32_t kv_offset = params.get_kv_block_expanding_offset(0);  // Single prefill: batch_idx=0
++        mask_iteration = block_expanding_mask_iteration(
++            q_tile_start, chunk_start, chunk_size, dllm_block_size, CTA_TILE_KV, q_offset, kv_offset);
++      } else if constexpr (MASK_MODE == MaskMode::kCausal) {
++        mask_iteration =
++            min(chunk_size,
++                sub_if_greater_or_zero(kv_len + ceil_div((bx * CTA_TILE_Q), group_size) - qo_len,
++                                       chunk_start)) /
++            CTA_TILE_KV;
++      } else {
++        mask_iteration = chunk_size / CTA_TILE_KV;
++      }
+ 
+       constexpr uint32_t fp4_pack = is_fp4_type_v<DTypeKV> ? 2 : 1;
+       DTypeKV* k_ptr =
+@@ -1903,7 +1935,15 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
+                                   qo_len, kv_len, group_size, s_frag, tid, kv_head_idx);
+ 
+         // apply mask
+-        if (MASK_MODE == MaskMode::kCustom || (iter >= mask_iteration || iter < window_iteration)) {
++        bool needs_mask;
++        if constexpr (MASK_MODE == MaskMode::kCustom) {
++          needs_mask = true;
++        } else if constexpr (MASK_MODE == MaskMode::kBlockExpanding) {
++          needs_mask = (iter >= mask_iteration);
++        } else {
++          needs_mask = (iter >= mask_iteration || iter < window_iteration);
++        }
++        if (needs_mask) {
+           logits_mask<KTraits>(params, variant, /*batch_idx=*/0, qo_packed_idx_base, kv_idx_base,
+                                qo_len, kv_len, chunk_end, group_size, s_frag, tid, kv_head_idx);
+         }
+@@ -2353,28 +2393,46 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
+         block.sync();
+       }
+ 
+-      const uint32_t num_iterations = ceil_div(
+-          (MASK_MODE == MaskMode::kCausal
+-               ? min(chunk_size,
+-                     sub_if_greater_or_zero(
+-                         kv_len - qo_len + ceil_div(((qo_tile_idx + 1) * CTA_TILE_Q), group_size),
+-                         chunk_start))
+-               : chunk_size),
+-          CTA_TILE_KV);
++      uint32_t num_iterations;
++      if constexpr (MASK_MODE == MaskMode::kBlockExpanding) {
++        const uint32_t dllm_block_size = params.dllm_block_size;
++        const uint32_t q_offset = params.get_q_block_expanding_offset(request_idx);
++        const uint32_t q_tile_end = min(qo_len, ceil_div(((qo_tile_idx + 1) * CTA_TILE_Q), group_size));
++        num_iterations = block_expanding_num_iterations(
++            q_tile_end, chunk_start, chunk_size, dllm_block_size, CTA_TILE_KV, q_offset);
++      } else if constexpr (MASK_MODE == MaskMode::kCausal) {
++        num_iterations = ceil_div(
++            min(chunk_size,
++                sub_if_greater_or_zero(
++                    kv_len - qo_len + ceil_div(((qo_tile_idx + 1) * CTA_TILE_Q), group_size),
++                    chunk_start)),
++            CTA_TILE_KV);
++      } else {
++        num_iterations = ceil_div(chunk_size, CTA_TILE_KV);
++      }
+ 
+       const uint32_t window_iteration = ceil_div(
+           sub_if_greater_or_zero(kv_len + ceil_div((qo_tile_idx + 1) * CTA_TILE_Q, group_size),
+                                  qo_len + window_left + chunk_start),
+           CTA_TILE_KV);
+ 
+-      const uint32_t mask_iteration =
+-          (MASK_MODE == MaskMode::kCausal
+-               ? min(chunk_size,
+-                     sub_if_greater_or_zero(
+-                         kv_len + ceil_div((qo_tile_idx * CTA_TILE_Q), group_size) - qo_len,
+-                         chunk_start))
+-               : chunk_size) /
+-          CTA_TILE_KV;
++      uint32_t mask_iteration;
++      if constexpr (MASK_MODE == MaskMode::kBlockExpanding) {
++        const uint32_t dllm_block_size = params.dllm_block_size;
++        const uint32_t q_offset = params.get_q_block_expanding_offset(request_idx);
++        const uint32_t kv_offset = params.get_kv_block_expanding_offset(request_idx);
++        const uint32_t q_tile_start = ceil_div((qo_tile_idx * CTA_TILE_Q), group_size);
++        mask_iteration = block_expanding_mask_iteration(
++            q_tile_start, chunk_start, chunk_size, dllm_block_size, CTA_TILE_KV, q_offset, kv_offset);
++      } else if constexpr (MASK_MODE == MaskMode::kCausal) {
++        mask_iteration =
++            min(chunk_size,
++                sub_if_greater_or_zero(kv_len + ceil_div((qo_tile_idx * CTA_TILE_Q), group_size) - qo_len,
++                                       chunk_start)) /
++            CTA_TILE_KV;
++      } else {
++        mask_iteration = chunk_size / CTA_TILE_KV;
++      }
+ 
+       // K/V-shared path: V is loaded into k_smem (time-shared); v_smem is a [1] stub.
+       smem_t<SWIZZLE_MODE_KV> k_smem(smem_storage.k_smem),
+@@ -2484,7 +2542,15 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
+                                   kv_head_idx);
+ 
+         // apply mask
+-        if (MASK_MODE == MaskMode::kCustom || (iter >= mask_iteration || iter < window_iteration)) {
++        bool needs_mask;
++        if constexpr (MASK_MODE == MaskMode::kCustom) {
++          needs_mask = true;
++        } else if constexpr (MASK_MODE == MaskMode::kBlockExpanding) {
++          needs_mask = (iter >= mask_iteration);
++        } else {
++          needs_mask = (iter >= mask_iteration || iter < window_iteration);
++        }
++        if (needs_mask) {
+           logits_mask<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
+                                kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag, tid,
+                                kv_head_idx);
+@@ -3111,14 +3177,22 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
+       uint32_t num_iterations = 0;
+ 
+       if constexpr (MASK_MODE != MaskMode::kMultiItemScoring) {
+-        num_iterations = ceil_div(
+-            (MASK_MODE == MaskMode::kCausal
+-                 ? min(chunk_size,
+-                       sub_if_greater_or_zero(
+-                           kv_len - qo_len + ceil_div(((qo_tile_idx + 1) * CTA_TILE_Q), group_size),
+-                           chunk_start))
+-                 : chunk_size),
+-            CTA_TILE_KV);
++        if constexpr (MASK_MODE == MaskMode::kBlockExpanding) {
++          const uint32_t dllm_block_size = params.dllm_block_size;
++          const uint32_t q_offset = params.get_q_block_expanding_offset(request_idx);
++          const uint32_t q_tile_end = min(qo_len, ceil_div(((qo_tile_idx + 1) * CTA_TILE_Q), group_size));
++          num_iterations = block_expanding_num_iterations(
++              q_tile_end, chunk_start, chunk_size, dllm_block_size, CTA_TILE_KV, q_offset);
++        } else if constexpr (MASK_MODE == MaskMode::kCausal) {
++          num_iterations = ceil_div(
++              min(chunk_size,
++                  sub_if_greater_or_zero(
++                      kv_len - qo_len + ceil_div(((qo_tile_idx + 1) * CTA_TILE_Q), group_size),
++                      chunk_start)),
++              CTA_TILE_KV);
++        } else {
++          num_iterations = ceil_div(chunk_size, CTA_TILE_KV);
++        }
+       } else if constexpr (MASK_MODE == MaskMode::kMultiItemScoring) {
+         num_iterations_prefix = ceil_div(
+             min(min(chunk_size,
+@@ -3151,14 +3225,24 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
+                                  qo_len + window_left + chunk_start),
+           CTA_TILE_KV);
+ 
+-      const uint32_t mask_iteration =
+-          (MASK_MODE == MaskMode::kCausal || MASK_MODE == MaskMode::kMultiItemScoring
+-               ? min(chunk_size,
+-                     sub_if_greater_or_zero(
+-                         kv_len + ceil_div((qo_tile_idx * CTA_TILE_Q), group_size) - qo_len,
+-                         chunk_start))
+-               : chunk_size) /
+-          CTA_TILE_KV;
++      uint32_t mask_iteration;
++      if constexpr (MASK_MODE == MaskMode::kBlockExpanding) {
++        const uint32_t dllm_block_size = params.dllm_block_size;
++        const uint32_t q_offset = params.get_q_block_expanding_offset(request_idx);
++        const uint32_t kv_offset = params.get_kv_block_expanding_offset(request_idx);
++        const uint32_t q_tile_start = ceil_div((qo_tile_idx * CTA_TILE_Q), group_size);
++        mask_iteration = block_expanding_mask_iteration(
++            q_tile_start, chunk_start, chunk_size, dllm_block_size, CTA_TILE_KV, q_offset, kv_offset);
++      } else if constexpr (MASK_MODE == MaskMode::kCausal || MASK_MODE == MaskMode::kMultiItemScoring) {
++        mask_iteration =
++            min(chunk_size,
++                sub_if_greater_or_zero(
++                    kv_len + ceil_div((qo_tile_idx * CTA_TILE_Q), group_size) - qo_len,
++                    chunk_start)) /
++            CTA_TILE_KV;
++      } else {
++        mask_iteration = chunk_size / CTA_TILE_KV;
++      }
+ 
+ #pragma unroll 1
+       for (uint32_t iter = 0; iter < num_iterations;
+@@ -3228,13 +3312,19 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
+                                   kv_head_idx);
+ 
+         // apply mask
+-        if (MASK_MODE == MaskMode::kCustom) {
++        if constexpr (MASK_MODE == MaskMode::kCustom) {
+           logits_mask<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
+                                kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag, tid,
+                                kv_head_idx);
+         } else {
+           if constexpr (MASK_MODE != MaskMode::kMultiItemScoring) {
+-            if (iter >= mask_iteration || iter < window_iteration) {
++            bool needs_mask;
++            if constexpr (MASK_MODE == MaskMode::kBlockExpanding) {
++              needs_mask = (iter >= mask_iteration);
++            } else {
++              needs_mask = (iter >= mask_iteration || iter < window_iteration);
++            }
++            if (needs_mask) {
+               logits_mask<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
+                                    kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag, tid,
+                                    kv_head_idx);
+diff --git a/include/flashinfer/utils.cuh b/include/flashinfer/utils.cuh
+index 15214049c1..2bfba3fcca 100644
+--- a/include/flashinfer/utils.cuh
++++ b/include/flashinfer/utils.cuh
+@@ -183,6 +183,11 @@
+       __VA_ARGS__                                                 \
+       break;                                                      \
+     }                                                             \
++    case MaskMode::kBlockExpanding: {                             \
++      constexpr MaskMode MASK_MODE = MaskMode::kBlockExpanding;   \
++      __VA_ARGS__                                                 \
++      break;                                                      \
++    }                                                             \
+     default: {                                                    \
+       std::ostringstream err_msg;                                 \
+       err_msg << "Unsupported mask_mode: " << int(mask_mode);     \
+@@ -545,6 +550,12 @@ __device__ __forceinline__ uint32_t dim4_offset(const uint32_t& dim_c, const uin
+   template <typename T>                                                                        \
+   inline constexpr bool has_##member##_v = has_##member<T>::value;
+ 
++// DLLM Block Expanding related type traits (defined once here to avoid ODR violations)
++DEFINE_HAS_MEMBER(dllm_block_size)
++DEFINE_HAS_MEMBER(q_block_expanding_offset)
++DEFINE_HAS_MEMBER(maybe_q_block_expanding_offset)  // per-batch q_offset pointer for FA3 BatchPrefill
++DEFINE_HAS_MEMBER(kv_block_expanding_offset)       // kv_offset for Cascade Current Chunk
++DEFINE_HAS_MEMBER(maybe_kv_block_expanding_offset) // per-batch kv_offset pointer for FA3 BatchPrefill
+ }  // namespace flashinfer
+ 
+ #endif  // FLASHINFER_UTILS_CUH_
+diff --git a/scripts/task_jit_run_tests_dllm.sh b/scripts/task_jit_run_tests_dllm.sh
+new file mode 100755
+index 0000000000..d03c54a6e8
+--- /dev/null
++++ b/scripts/task_jit_run_tests_dllm.sh
+@@ -0,0 +1,17 @@
++#!/bin/bash
++
++set -eo pipefail
++set -x
++: ${MAX_JOBS:=$(nproc)}
++: ${CUDA_VISIBLE_DEVICES:=0}
++: ${SKIP_INSTALL:=0}
++
++# Source test environment setup (handles package overrides like TVM-FFI)
++source "$(dirname "${BASH_SOURCE[0]}")/setup_test_env.sh"
++
++if [ "$SKIP_INSTALL" = "0" ]; then
++  pip install -e . -v
++fi
++
++# DLLM Block Extend Attention precision tests
++pytest -s tests/attention/test_dllm_blockwise_mask_attention.py
+\ No newline at end of file
+diff --git a/tests/attention/test_dllm_blockwise_mask_attention.py b/tests/attention/test_dllm_blockwise_mask_attention.py
+new file mode 100644
+index 0000000000..131bffe3bc
+--- /dev/null
++++ b/tests/attention/test_dllm_blockwise_mask_attention.py
+@@ -0,0 +1,674 @@
++"""DLLM Block Extend Attention Precision Tests
++
++Precision tests for Block Extend Attention used in Diffusion LLMs.
++
++Mask rule: mask[q, k] = ((q_local + q_offset) // B) >= (k // B)
++
++Test coverage:
++  - Single/multi request precision vs custom_mask reference
++  - Ragged and Paged KV cache wrappers
++  - Heterogeneous prefix lengths
++  - Cascade vs block-extend alignment
++  - FA2 and FA3 backends (FA3 only on SM90+)
++"""
++
++import math
++import torch
++import flashinfer
++from flashinfer import (
++    BatchPrefillWithPagedKVCacheWrapper,
++    BatchPrefillWithRaggedKVCacheWrapper,
++    merge_state,
++    single_prefill_with_kv_cache,
++)
++from flashinfer.dllm import (
++    BatchBlockExtendPagedOffsetWrapper,
++    BatchBlockExtendRaggedOffsetWrapper,
++    block_extend_attention_with_offset,
++)
++
++
++def get_available_backends(device=None):
++    """Get available backends based on GPU architecture."""
++    from flashinfer.utils import is_sm90a_supported
++
++    if device is None:
++        device = torch.device("cuda:0")
++
++    if is_sm90a_supported(device):
++        return ["fa2", "fa3"]
++    else:
++        return ["fa2"]
++
++
++def compute_block_extend_reference(
++    q: torch.Tensor,
++    k: torch.Tensor,
++    v: torch.Tensor,
++    dllm_block_size: int,
++    q_offset: int = 0,
++    sm_scale: float = None,
++) -> torch.Tensor:
++    """Reference implementation using custom_mask."""
++    qo_len = q.shape[0]
++    kv_len = k.shape[0]
++    if sm_scale is None:
++        head_dim = q.shape[-1]
++        sm_scale = 1.0 / math.sqrt(head_dim)
++
++    q_pos = torch.arange(qo_len, device=q.device) + q_offset
++    k_pos = torch.arange(kv_len, device=k.device)
++    q_block = q_pos.unsqueeze(1) // dllm_block_size
++    k_block = k_pos.unsqueeze(0) // dllm_block_size
++    mask_2d = (q_block >= k_block).to(torch.uint8)
++
++    return single_prefill_with_kv_cache(
++        q, k, v, custom_mask=mask_2d, sm_scale=sm_scale, backend="fa2"
++    )
++
++
++def test_dllm_precision_vs_custom_mask_fa2(
++    verbose: bool = True,
++    test_dtypes: list = None,
++):
++    """DLLM precision test: compare with native Custom Mask FA2 implementation."""
++    device = torch.device("cuda:0")
++    available_backends = get_available_backends(device)
++    has_fa3 = "fa3" in available_backends
++
++    if test_dtypes is None:
++        test_dtypes = [torch.float16, torch.bfloat16]
++
++    dtype_tolerances = {
++        torch.float16: 1e-2,
++        torch.bfloat16: 2e-2,
++    }
++    dtype_names = {
++        torch.float16: "fp16",
++        torch.bfloat16: "bf16",
++    }
++
++    # Core test configs covering key dimensions
++    test_configs = [
++        # Different block_size
++        {"dllm_block_size": 16, "qo_len": 64, "kv_len": 128, "q_offset": 0, "num_heads": 32, "num_kv_heads": 8, "head_dim": 128},
++        {"dllm_block_size": 32, "qo_len": 64, "kv_len": 128, "q_offset": 0, "num_heads": 32, "num_kv_heads": 8, "head_dim": 128},
++        {"dllm_block_size": 64, "qo_len": 64, "kv_len": 128, "q_offset": 0, "num_heads": 32, "num_kv_heads": 8, "head_dim": 128},
++        # Different q_offset (incremental prefill steps)
++        {"dllm_block_size": 32, "qo_len": 64, "kv_len": 192, "q_offset": 64, "num_heads": 32, "num_kv_heads": 8, "head_dim": 128},
++        # GQA and MQA
++        {"dllm_block_size": 32, "qo_len": 64, "kv_len": 128, "q_offset": 0, "num_heads": 32, "num_kv_heads": 4, "head_dim": 128},
++        {"dllm_block_size": 32, "qo_len": 64, "kv_len": 128, "q_offset": 0, "num_heads": 32, "num_kv_heads": 1, "head_dim": 128},
++        # Different head_dim
++        {"dllm_block_size": 32, "qo_len": 64, "kv_len": 128, "q_offset": 0, "num_heads": 32, "num_kv_heads": 8, "head_dim": 64},
++        # Long sequence
++        {"dllm_block_size": 32, "qo_len": 128, "kv_len": 2048, "q_offset": 0, "num_heads": 32, "num_kv_heads": 8, "head_dim": 128},
++        # Non-aligned boundary
++        {"dllm_block_size": 64, "qo_len": 33, "kv_len": 97, "q_offset": 17, "num_heads": 32, "num_kv_heads": 8, "head_dim": 128},
++    ]
++
++    # Multi-request test configs
++    multi_req_configs = [
++        {"num_requests": 4, "dllm_block_size": 32, "qo_len": 64, "kv_len": 128, "q_offset": 0, "num_heads": 32, "num_kv_heads": 8, "head_dim": 128},
++        {"num_requests": 4, "dllm_block_size": 32, "qo_len": 64, "kv_len": 192, "q_offset": 64, "num_heads": 32, "num_kv_heads": 8, "head_dim": 128},
++        {"num_requests": 4, "dllm_block_size": 32, "qo_len": 64, "kv_len": 128, "q_offset": 0, "num_heads": 32, "num_kv_heads": 4, "head_dim": 128},
++    ]
++
++    page_size = 16
++
++    for dtype in test_dtypes:
++        dtype_name = dtype_names[dtype]
++        tol = dtype_tolerances[dtype]
++
++        print(f"\n{'='*100}")
++        print(f"DLLM Precision Test vs Custom Mask [{dtype_name.upper()}]  backends={available_backends}")
++        print(f"{'='*100}")
++
++        # ===== Part 1: Single-request =====
++        single_req_results = []
++        for cfg_idx, cfg in enumerate(test_configs):
++            dllm_block_size = cfg["dllm_block_size"]
++            qo_len = cfg["qo_len"]
++            kv_len = cfg["kv_len"]
++            q_offset = cfg["q_offset"]
++            num_heads = cfg["num_heads"]
++            num_kv_heads = cfg["num_kv_heads"]
++            head_dim = cfg["head_dim"]
++            sm_scale = 1.0 / math.sqrt(head_dim)
++
++            q = torch.randn(qo_len, num_heads, head_dim, dtype=dtype, device=device)
++            k = torch.randn(kv_len, num_kv_heads, head_dim, dtype=dtype, device=device)
++            v = torch.randn(kv_len, num_kv_heads, head_dim, dtype=dtype, device=device)
++
++            q_pos = torch.arange(qo_len, device=device) + q_offset
++            k_pos = torch.arange(kv_len, device=device)
++            mask_2d = ((q_pos.unsqueeze(1) // dllm_block_size) >= (k_pos.unsqueeze(0) // dllm_block_size)).to(torch.uint8)
++            ref_output = single_prefill_with_kv_cache(q, k, v, custom_mask=mask_2d, sm_scale=sm_scale, backend="fa2")
++
++            result = {"config_idx": cfg_idx, **cfg}
++
++            qo_indptr = torch.tensor([0, qo_len], dtype=torch.int32, device=device)
++            kv_indptr = torch.tensor([0, kv_len], dtype=torch.int32, device=device)
++            q_offset_tensor = torch.tensor([q_offset], dtype=torch.int32, device=device)
++
++            for backend in available_backends:
++                workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
++                wrapper = BatchBlockExtendRaggedOffsetWrapper(
++                    workspace, kv_layout="NHD", dllm_block_size=dllm_block_size, backend=backend
++                )
++                wrapper.plan(
++                    qo_indptr=qo_indptr, kv_indptr=kv_indptr,
++                    num_qo_heads=num_heads, num_kv_heads=num_kv_heads,
++                    head_dim=head_dim, q_data_type=dtype,
++                    sm_scale=sm_scale, q_offsets=q_offset_tensor,
++                )
++                bbe_output = wrapper.run(q, k, v)
++                bbe_diff = (bbe_output - ref_output).abs().max().item()
++                result[f"bbe_{backend}_max_diff"] = bbe_diff
++                result[f"bbe_{backend}_pass"] = bbe_diff < tol
++                del workspace, wrapper
++
++            # V2 API
++            v2_output = block_extend_attention_with_offset(
++                q, k, v, dllm_block_size=dllm_block_size, q_offset=q_offset, sm_scale=sm_scale, backend="fa2"
++            )
++            v2_diff = (v2_output - ref_output).abs().max().item()
++            result["v2_max_diff"] = v2_diff
++            result["v2_pass"] = v2_diff < tol
++
++            single_req_results.append(result)
++
++            if verbose:
++                fa2_status = "PASS" if result["bbe_fa2_pass"] else "FAIL"
++                v2_status = "PASS" if result["v2_pass"] else "FAIL"
++                msg = f"  [{cfg_idx:02d}] B={dllm_block_size:3d} qo={qo_len:4d} kv={kv_len:4d} off={q_offset:3d} h={num_heads}/{num_kv_heads} d={head_dim}"
++                msg += f"  FA2:{fa2_status}({result['bbe_fa2_max_diff']:.6f})"
++                if has_fa3:
++                    fa3_status = "PASS" if result["bbe_fa3_pass"] else "FAIL"
++                    msg += f"  FA3:{fa3_status}({result['bbe_fa3_max_diff']:.6f})"
++                msg += f"  V2:{v2_status}({v2_diff:.6f})"
++                print(msg)
++
++            torch.cuda.empty_cache()
++
++        # Single-request summary
++        print(f"\n[Single-request Summary] [{dtype_name}]")
++        for backend in available_backends:
++            pass_count = sum(1 for r in single_req_results if r[f"bbe_{backend}_pass"])
++            print(f"  BBE ({backend.upper()}): {pass_count}/{len(single_req_results)} PASS")
++        v2_pass_count = sum(1 for r in single_req_results if r["v2_pass"])
++        print(f"  V2: {v2_pass_count}/{len(single_req_results)} PASS")
++
++        # ===== Part 2: Multi-request =====
++        multi_req_results = []
++        for cfg_idx, cfg in enumerate(multi_req_configs):
++            num_requests = cfg["num_requests"]
++            dllm_block_size = cfg["dllm_block_size"]
++            qo_len = cfg["qo_len"]
++            kv_len = cfg["kv_len"]
++            q_offset = cfg["q_offset"]
++            num_heads = cfg["num_heads"]
++            num_kv_heads = cfg["num_kv_heads"]
++            head_dim = cfg["head_dim"]
++            sm_scale = 1.0 / math.sqrt(head_dim)
++
++            q_batch = torch.randn(num_requests * qo_len, num_heads, head_dim, dtype=dtype, device=device)
++            k_batch = torch.randn(num_requests * kv_len, num_kv_heads, head_dim, dtype=dtype, device=device)
++            v_batch = torch.randn(num_requests * kv_len, num_kv_heads, head_dim, dtype=dtype, device=device)
++
++            qo_indptr = torch.tensor([i * qo_len for i in range(num_requests + 1)], dtype=torch.int32, device=device)
++            kv_indptr = torch.tensor([i * kv_len for i in range(num_requests + 1)], dtype=torch.int32, device=device)
++            q_offsets = torch.full((num_requests,), q_offset, dtype=torch.int32, device=device)
++
++            # Reference: per-request custom_mask
++            ref_outputs = []
++            for req_idx in range(num_requests):
++                q_req = q_batch[req_idx * qo_len:(req_idx + 1) * qo_len]
++                k_req = k_batch[req_idx * kv_len:(req_idx + 1) * kv_len]
++                v_req = v_batch[req_idx * kv_len:(req_idx + 1) * kv_len]
++                q_pos = torch.arange(qo_len, device=device) + q_offset
++                k_pos = torch.arange(kv_len, device=device)
++                mask_2d = ((q_pos.unsqueeze(1) // dllm_block_size) >= (k_pos.unsqueeze(0) // dllm_block_size)).to(torch.uint8)
++                ref_outputs.append(single_prefill_with_kv_cache(q_req, k_req, v_req, custom_mask=mask_2d, sm_scale=sm_scale, backend="fa2"))
++            ref_output = torch.cat(ref_outputs, dim=0)
++
++            result = {"config_idx": cfg_idx, **cfg}
++
++            for backend in available_backends:
++                workspace = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=device)
++                bbe_wrapper = BatchBlockExtendRaggedOffsetWrapper(
++                    workspace, kv_layout="NHD", dllm_block_size=dllm_block_size, backend=backend
++                )
++                bbe_wrapper.plan(
++                    qo_indptr=qo_indptr, kv_indptr=kv_indptr,
++                    num_qo_heads=num_heads, num_kv_heads=num_kv_heads,
++                    head_dim=head_dim, q_data_type=dtype,
++                    sm_scale=sm_scale, q_offsets=q_offsets,
++                )
++                bbe_output = bbe_wrapper.run(q_batch, k_batch, v_batch)
++                bbe_diff = (bbe_output - ref_output).abs().max().item()
++                result[f"bbe_{backend}_max_diff"] = bbe_diff
++                result[f"bbe_{backend}_pass"] = bbe_diff < tol
++                del bbe_wrapper
++
++            multi_req_results.append(result)
++
++            if verbose:
++                fa2_status = "PASS" if result["bbe_fa2_pass"] else "FAIL"
++                msg = f"  [{cfg_idx:02d}] reqs={num_requests} B={dllm_block_size:3d} qo={qo_len:4d} kv={kv_len:4d} off={q_offset:3d}"
++                msg += f"  FA2:{fa2_status}({result['bbe_fa2_max_diff']:.6f})"
++                if has_fa3:
++                    fa3_status = "PASS" if result["bbe_fa3_pass"] else "FAIL"
++                    msg += f"  FA3:{fa3_status}({result['bbe_fa3_max_diff']:.6f})"
++                print(msg)
++
++            torch.cuda.empty_cache()
++
++        print(f"\n[Multi-request Summary] [{dtype_name}]")
++        for backend in available_backends:
++            pass_count = sum(1 for r in multi_req_results if r[f"bbe_{backend}_pass"])
++            print(f"  BBE ({backend.upper()}): {pass_count}/{len(multi_req_results)} PASS")
++
++        # ===== Part 3: Paged KV Cache =====
++        paged_results = []
++        for cfg_idx, cfg in enumerate(test_configs[:5]):  # subset for paged
++            dllm_block_size = cfg["dllm_block_size"]
++            qo_len = cfg["qo_len"]
++            kv_len = cfg["kv_len"]
++            q_offset = cfg["q_offset"]
++            num_heads = cfg["num_heads"]
++            num_kv_heads = cfg["num_kv_heads"]
++            head_dim = cfg["head_dim"]
++            sm_scale = 1.0 / math.sqrt(head_dim)
++
++            q = torch.randn(qo_len, num_heads, head_dim, dtype=dtype, device=device)
++            num_pages = (kv_len + page_size - 1) // page_size
++            kv_data = torch.randn(num_pages, 2, page_size, num_kv_heads, head_dim, dtype=dtype, device=device)
++
++            paged_kv_indices = torch.arange(num_pages, dtype=torch.int32, device=device)
++            paged_kv_indptr = torch.tensor([0, num_pages], dtype=torch.int32, device=device)
++            last_page_len = kv_len - (num_pages - 1) * page_size if kv_len % page_size != 0 else page_size
++            paged_kv_last_page_len = torch.tensor([last_page_len], dtype=torch.int32, device=device)
++
++            k_continuous = kv_data[:, 0, :, :, :].reshape(-1, num_kv_heads, head_dim)[:kv_len]
++            v_continuous = kv_data[:, 1, :, :, :].reshape(-1, num_kv_heads, head_dim)[:kv_len]
++
++            q_pos = torch.arange(qo_len, device=device) + q_offset
++            k_pos = torch.arange(kv_len, device=device)
++            mask_2d = ((q_pos.unsqueeze(1) // dllm_block_size) >= (k_pos.unsqueeze(0) // dllm_block_size)).to(torch.uint8)
++            ref_output = single_prefill_with_kv_cache(q, k_continuous, v_continuous, custom_mask=mask_2d, sm_scale=sm_scale, backend="fa2")
++
++            result = {"config_idx": cfg_idx, **cfg}
++
++            qo_indptr = torch.tensor([0, qo_len], dtype=torch.int32, device=device)
++            q_offsets = torch.tensor([q_offset], dtype=torch.int32, device=device)
++
++            for backend in available_backends:
++                paged_wrapper = BatchBlockExtendPagedOffsetWrapper(
++                    torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device),
++                    kv_layout="NHD", dllm_block_size=dllm_block_size, backend=backend
++                )
++                paged_wrapper.plan(
++                    qo_indptr=qo_indptr, paged_kv_indptr=paged_kv_indptr,
++                    paged_kv_indices=paged_kv_indices, paged_kv_last_page_len=paged_kv_last_page_len,
++                    num_qo_heads=num_heads, num_kv_heads=num_kv_heads,
++                    head_dim=head_dim, page_size=page_size,
++                    q_data_type=dtype, sm_scale=sm_scale, q_offsets=q_offsets,
++                )
++                paged_output = paged_wrapper.run(q, kv_data)
++                paged_diff = (paged_output - ref_output).abs().max().item()
++                result[f"paged_{backend}_max_diff"] = paged_diff
++                result[f"paged_{backend}_pass"] = paged_diff < tol
++                del paged_wrapper
++
++            paged_results.append(result)
++
++            if verbose:
++                fa2_status = "PASS" if result["paged_fa2_pass"] else "FAIL"
++                msg = f"  [{cfg_idx:02d}] B={dllm_block_size:3d} qo={qo_len:4d} kv={kv_len:4d}  Paged-FA2:{fa2_status}({result['paged_fa2_max_diff']:.6f})"
++                if has_fa3:
++                    fa3_status = "PASS" if result["paged_fa3_pass"] else "FAIL"
++                    msg += f"  Paged-FA3:{fa3_status}({result['paged_fa3_max_diff']:.6f})"
++                print(msg)
++
++            torch.cuda.empty_cache()
++
++        print(f"\n[Paged KV Cache Summary] [{dtype_name}]")
++        for backend in available_backends:
++            pass_count = sum(1 for r in paged_results if r[f"paged_{backend}_pass"])
++            print(f"  Paged ({backend.upper()}): {pass_count}/{len(paged_results)} PASS")
++
++        # Overall result
++        if has_fa3:
++            all_single_pass = all(r["bbe_fa2_pass"] and r["bbe_fa3_pass"] and r["v2_pass"] for r in single_req_results)
++            all_multi_pass = all(r["bbe_fa2_pass"] and r["bbe_fa3_pass"] for r in multi_req_results)
++            all_paged_pass = all(r["paged_fa2_pass"] and r["paged_fa3_pass"] for r in paged_results)
++        else:
++            all_single_pass = all(r["bbe_fa2_pass"] and r["v2_pass"] for r in single_req_results)
++            all_multi_pass = all(r["bbe_fa2_pass"] for r in multi_req_results)
++            all_paged_pass = all(r["paged_fa2_pass"] for r in paged_results)
++
++        overall_pass = all_single_pass and all_multi_pass and all_paged_pass
++        status = "ALL PASS" if overall_pass else "SOME FAILED"
++        print(f"\n  Overall: {status}")
++
++    return {"overall_pass": overall_pass}
++
++
++def test_heterogeneous_prefix_batch(
++    verbose: bool = True,
++    backend: str = "fa2",
++):
++    """Heterogeneous prefix test: different requests have different prefix lengths."""
++    from flashinfer.dllm import BatchBlockExtendRaggedOffsetWrapper
++
++    device = torch.device("cuda:0")
++    dtype = torch.float16
++    tol = 1e-2
++
++    test_configs = [
++        {"name": "Req0(has_prefix) + Req1(no_prefix)", "dllm_block_size": 32,
++         "requests": [{"qo_len": 64, "kv_len": 128, "q_offset": 64}, {"qo_len": 32, "kv_len": 32, "q_offset": 0}]},
++        {"name": "Req0(step_3) + Req1(step_0) + Req2(step_1)", "dllm_block_size": 32,
++         "requests": [{"qo_len": 32, "kv_len": 128, "q_offset": 96}, {"qo_len": 32, "kv_len": 32, "q_offset": 0}, {"qo_len": 32, "kv_len": 64, "q_offset": 32}]},
++        {"name": "Long_short_prompt_mix(512_vs_32)", "dllm_block_size": 32,
++         "requests": [{"qo_len": 64, "kv_len": 512, "q_offset": 448}, {"qo_len": 32, "kv_len": 32, "q_offset": 0}]},
++        {"name": "4_requests_mixed_scenario", "dllm_block_size": 32,
++         "requests": [{"qo_len": 32, "kv_len": 128, "q_offset": 96}, {"qo_len": 32, "kv_len": 32, "q_offset": 0}, {"qo_len": 64, "kv_len": 256, "q_offset": 192}, {"qo_len": 32, "kv_len": 64, "q_offset": 32}]},
++    ]
++
++    num_heads = 32
++    num_kv_heads = 8
++    head_dim = 128
++    sm_scale = 1.0 / math.sqrt(head_dim)
++
++    results = []
++    for cfg_idx, cfg in enumerate(test_configs):
++        requests = cfg["requests"]
++        dllm_block_size = cfg["dllm_block_size"]
++
++        all_q, all_k, all_v = [], [], []
++        ref_outputs = []
++        qo_indptr = [0]
++        kv_indptr = [0]
++        q_offsets_list = []
++
++        for req in requests:
++            q = torch.randn(req["qo_len"], num_heads, head_dim, dtype=dtype, device=device)
++            k = torch.randn(req["kv_len"], num_kv_heads, head_dim, dtype=dtype, device=device)
++            v = torch.randn(req["kv_len"], num_kv_heads, head_dim, dtype=dtype, device=device)
++            all_q.append(q)
++            all_k.append(k)
++            all_v.append(v)
++
++            q_pos = torch.arange(req["qo_len"], device=device) + req["q_offset"]
++            k_pos = torch.arange(req["kv_len"], device=device)
++            mask_2d = ((q_pos.unsqueeze(1) // dllm_block_size) >= (k_pos.unsqueeze(0) // dllm_block_size)).to(torch.uint8)
++            ref_outputs.append(single_prefill_with_kv_cache(q, k, v, custom_mask=mask_2d, sm_scale=sm_scale, backend="fa2"))
++
++            qo_indptr.append(qo_indptr[-1] + req["qo_len"])
++            kv_indptr.append(kv_indptr[-1] + req["kv_len"])
++            q_offsets_list.append(req["q_offset"])
++
++        q_batch = torch.cat(all_q, dim=0)
++        k_batch = torch.cat(all_k, dim=0)
++        v_batch = torch.cat(all_v, dim=0)
++        ref_output = torch.cat(ref_outputs, dim=0)
++
++        workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
++        wrapper = BatchBlockExtendRaggedOffsetWrapper(workspace, kv_layout="NHD", dllm_block_size=dllm_block_size, backend=backend)
++        wrapper.plan(
++            qo_indptr=torch.tensor(qo_indptr, dtype=torch.int32, device=device),
++            kv_indptr=torch.tensor(kv_indptr, dtype=torch.int32, device=device),
++            num_qo_heads=num_heads, num_kv_heads=num_kv_heads,
++            head_dim=head_dim, q_data_type=dtype,
++            sm_scale=sm_scale,
++            q_offsets=torch.tensor(q_offsets_list, dtype=torch.int32, device=device),
++        )
++        bbe_output = wrapper.run(q_batch, k_batch, v_batch)
++        max_diff = (bbe_output - ref_output).abs().max().item()
++        passed = max_diff < tol
++
++        results.append({"config_idx": cfg_idx, "name": cfg["name"], "max_diff": max_diff, "passed": passed})
++        if verbose:
++            status = "PASS" if passed else "FAIL"
++            print(f"  [{cfg_idx}] {cfg['name']}: max_diff={max_diff:.6f} [{status}]")
++
++        torch.cuda.empty_cache()
++
++    all_pass = all(r["passed"] for r in results)
++    assert all_pass, f"Heterogeneous prefix test failed: {[r for r in results if not r['passed']]}"
++    return results
++
++
++def test_cascade_current_chunk_batch(
++    verbose: bool = True,
++    backend: str = "fa2",
++):
++    """Batch cascade test: current chunk only (no prefix merge needed)."""
++    from flashinfer.dllm import BatchBlockExtendRaggedOffsetWrapper
++
++    device = torch.device("cuda:0")
++    dtype = torch.float16
++    tol = 1e-2
++
++    num_heads = 32
++    num_kv_heads = 8
++    head_dim = 128
++    sm_scale = 1.0 / math.sqrt(head_dim)
++
++    test_configs = [
++        {"name": "Req0(has_prefix) + Req1(no_prefix)", "dllm_block_size": 32,
++         "requests": [{"qo_len": 32, "kv_len": 128}, {"qo_len": 32, "kv_len": 32}]},
++        {"name": "4_requests_mixed(step_0,1,2,3)", "dllm_block_size": 32,
++         "requests": [{"qo_len": 32, "kv_len": 32}, {"qo_len": 32, "kv_len": 64}, {"qo_len": 32, "kv_len": 96}, {"qo_len": 32, "kv_len": 128}]},
++        {"name": "Req0(chunk=64) + Req1(chunk=32)", "dllm_block_size": 32,
++         "requests": [{"qo_len": 64, "kv_len": 128}, {"qo_len": 32, "kv_len": 64}]},
++    ]
++
++    results = []
++    for cfg_idx, cfg in enumerate(test_configs):
++        dllm_block_size = cfg["dllm_block_size"]
++        requests = cfg["requests"]
++
++        all_q, all_k, all_v = [], [], []
++        ref_outputs = []
++        qo_indptr = [0]
++        kv_indptr = [0]
++        q_offsets_list = []
++
++        for req_idx, req in enumerate(requests):
++            qo_len = req["qo_len"]
++            kv_len = req["kv_len"]
++            q_offset = kv_len - qo_len  # incremental step offset
++
++            q = torch.randn(qo_len, num_heads, head_dim, dtype=dtype, device=device)
++            k = torch.randn(kv_len, num_kv_heads, head_dim, dtype=dtype, device=device)
++            v = torch.randn(kv_len, num_kv_heads, head_dim, dtype=dtype, device=device)
++            all_q.append(q)
++            all_k.append(k)
++            all_v.append(v)
++
++            q_pos = torch.arange(qo_len, device=device) + q_offset
++            k_pos = torch.arange(kv_len, device=device)
++            mask_2d = ((q_pos.unsqueeze(1) // dllm_block_size) >= (k_pos.unsqueeze(0) // dllm_block_size)).to(torch.uint8)
++            ref_outputs.append(single_prefill_with_kv_cache(q, k, v, custom_mask=mask_2d, sm_scale=sm_scale, backend="fa2"))
++
++            qo_indptr.append(qo_indptr[-1] + qo_len)
++            kv_indptr.append(kv_indptr[-1] + kv_len)
++            q_offsets_list.append(q_offset)
++
++        q_batch = torch.cat(all_q, dim=0)
++        k_batch = torch.cat(all_k, dim=0)
++        v_batch = torch.cat(all_v, dim=0)
++        ref_output = torch.cat(ref_outputs, dim=0)
++
++        workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
++        wrapper = BatchBlockExtendRaggedOffsetWrapper(workspace, kv_layout="NHD", dllm_block_size=dllm_block_size, backend=backend)
++        wrapper.plan(
++            qo_indptr=torch.tensor(qo_indptr, dtype=torch.int32, device=device),
++            kv_indptr=torch.tensor(kv_indptr, dtype=torch.int32, device=device),
++            num_qo_heads=num_heads, num_kv_heads=num_kv_heads,
++            head_dim=head_dim, q_data_type=dtype,
++            sm_scale=sm_scale,
++            q_offsets=torch.tensor(q_offsets_list, dtype=torch.int32, device=device),
++        )
++        bbe_output = wrapper.run(q_batch, k_batch, v_batch)
++        max_diff = (bbe_output - ref_output).abs().max().item()
++        passed = max_diff < tol
++
++        results.append({"config_idx": cfg_idx, "name": cfg["name"], "max_diff": max_diff, "passed": passed})
++        if verbose:
++            status = "PASS" if passed else "FAIL"
++            print(f"  [{cfg_idx}] {cfg['name']}: max_diff={max_diff:.6f} [{status}]")
++
++        torch.cuda.empty_cache()
++
++    all_pass = all(r["passed"] for r in results)
++    assert all_pass, f"Cascade current chunk test failed: {[r for r in results if not r['passed']]}"
++    return results
++
++
++def test_cascade_precision_alignment(
++    verbose: bool = True,
++):
++    """Step-by-step incremental prefill precision alignment test."""
++    device = torch.device("cuda:0")
++    dtype = torch.float16
++    tol = 1e-2
++
++    test_configs = [
++        {"dllm_block_size": 32, "num_steps": 4, "num_heads": 32, "num_kv_heads": 8, "head_dim": 128},
++        {"dllm_block_size": 64, "num_steps": 4, "num_heads": 32, "num_kv_heads": 8, "head_dim": 128},
++        {"dllm_block_size": 32, "num_steps": 4, "num_heads": 32, "num_kv_heads": 4, "head_dim": 128},
++        {"dllm_block_size": 32, "num_steps": 4, "num_heads": 32, "num_kv_heads": 8, "head_dim": 64},
++    ]
++
++    results = []
++    for cfg_idx, cfg in enumerate(test_configs):
++        dllm_block_size = cfg["dllm_block_size"]
++        num_steps = cfg["num_steps"]
++        num_heads = cfg["num_heads"]
++        num_kv_heads = cfg["num_kv_heads"]
++        head_dim = cfg["head_dim"]
++        sm_scale = 1.0 / math.sqrt(head_dim)
++
++        total_tokens = num_steps * dllm_block_size
++        q_all = torch.randn(total_tokens, num_heads, head_dim, dtype=dtype, device=device)
++        k_all = torch.randn(total_tokens, num_kv_heads, head_dim, dtype=dtype, device=device)
++        v_all = torch.randn(total_tokens, num_kv_heads, head_dim, dtype=dtype, device=device)
++
++        step_diffs = []
++        for step_idx in range(num_steps):
++            q_offset = step_idx * dllm_block_size
++            kv_len = (step_idx + 1) * dllm_block_size
++            qo_len = dllm_block_size
++
++            q_chunk = q_all[q_offset:q_offset + qo_len]
++            k_cumul = k_all[:kv_len]
++            v_cumul = v_all[:kv_len]
++
++            ref_output = compute_block_extend_reference(q_chunk, k_cumul, v_cumul, dllm_block_size, q_offset=q_offset, sm_scale=sm_scale)
++
++            qo_indptr = torch.tensor([0, qo_len], dtype=torch.int32, device=device)
++            kv_indptr = torch.tensor([0, kv_len], dtype=torch.int32, device=device)
++            q_offset_tensor = torch.tensor([q_offset], dtype=torch.int32, device=device)
++
++            workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
++            wrapper = BatchBlockExtendRaggedOffsetWrapper(workspace, kv_layout="NHD", dllm_block_size=dllm_block_size, backend="fa2")
++            wrapper.plan(
++                qo_indptr=qo_indptr, kv_indptr=kv_indptr,
++                num_qo_heads=num_heads, num_kv_heads=num_kv_heads,
++                head_dim=head_dim, q_data_type=dtype,
++                sm_scale=sm_scale, q_offsets=q_offset_tensor,
++            )
++            bbe_output = wrapper.run(q_chunk, k_cumul, v_cumul)
++            step_diff = (bbe_output - ref_output).abs().max().item()
++            step_diffs.append(step_diff)
++
++        max_diff = max(step_diffs)
++        passed = max_diff < tol
++
++        results.append({"config_idx": cfg_idx, **cfg, "max_diff": max_diff, "step_diffs": step_diffs, "pass": passed})
++        if verbose:
++            status = "PASS" if passed else "FAIL"
++            print(f"  [{cfg_idx}] B={dllm_block_size} steps={num_steps} h={num_heads}/{num_kv_heads} d={head_dim}: max_diff={max_diff:.6f} [{status}]")
++
++        torch.cuda.empty_cache()
++
++    overall_pass = all(r["pass"] for r in results)
++    assert overall_pass, f"Cascade precision alignment failed: {[r for r in results if not r['pass']]}"
++    return {"results": results, "overall_pass": overall_pass}
++
++
++def test_sglang_vs_block_extend_cascade(
++    verbose: bool = True,
++):
++    """SGLang Cascade vs Block Extend precision alignment."""
++    device = torch.device("cuda:0")
++    available_backends = get_available_backends(device)
++    cascade_backend = "fa3" if "fa3" in available_backends else "fa2"
++    dtype = torch.float16
++    tol = 1e-2
++
++    dllm_block_size = 32
++    num_heads = 32
++    num_kv_heads = 8
++    head_dim = 128
++    sm_scale = 1.0 / math.sqrt(head_dim)
++    num_steps = 4
++
++    total_tokens = num_steps * dllm_block_size
++    q_all = torch.randn(total_tokens, num_heads, head_dim, dtype=dtype, device=device)
++    k_all = torch.randn(total_tokens, num_kv_heads, head_dim, dtype=dtype, device=device)
++    v_all = torch.randn(total_tokens, num_kv_heads, head_dim, dtype=dtype, device=device)
++
++    # Reference: block_extend step-by-step
++    ref_outputs = []
++    for step_idx in range(num_steps):
++        q_offset = step_idx * dllm_block_size
++        kv_len = (step_idx + 1) * dllm_block_size
++        q_chunk = q_all[q_offset:q_offset + dllm_block_size]
++        k_cumul = k_all[:kv_len]
++        v_cumul = v_all[:kv_len]
++        ref_outputs.append(compute_block_extend_reference(q_chunk, k_cumul, v_cumul, dllm_block_size, q_offset=q_offset, sm_scale=sm_scale))
++
++    # SGLang Cascade: current + prefix + merge_state
++    cascade_outputs = []
++    for step_idx in range(num_steps):
++        q_offset = step_idx * dllm_block_size
++        kv_len = (step_idx + 1) * dllm_block_size
++        q_chunk = q_all[q_offset:q_offset + dllm_block_size]
++
++        # Current chunk
++        workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
++        current_wrapper = BatchPrefillWithRaggedKVCacheWrapper(workspace, kv_layout="NHD", backend=cascade_backend)
++        qo_indptr = torch.tensor([0, dllm_block_size], dtype=torch.int32, device=device)
++        kv_indptr = torch.tensor([0, dllm_block_size], dtype=torch.int32, device=device)
++        current_wrapper.plan(qo_indptr=qo_indptr, kv_indptr=kv_indptr, num_qo_heads=num_heads, num_kv_heads=num_kv_heads, head_dim_qk=head_dim, causal=False, sm_scale=sm_scale)
++        current_out, current_lse = current_wrapper.run(q_chunk, k_all[q_offset:kv_len], v_all[q_offset:kv_len], return_lse=True)
++
++        if step_idx == 0:
++            cascade_outputs.append(current_out)
++        else:
++            prefix_len = q_offset
++            workspace2 = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
++            prefix_wrapper = BatchPrefillWithRaggedKVCacheWrapper(workspace2, kv_layout="NHD", backend=cascade_backend)
++            kv_indptr_prefix = torch.tensor([0, prefix_len], dtype=torch.int32, device=device)
++            prefix_wrapper.plan(qo_indptr=qo_indptr, kv_indptr=kv_indptr_prefix, num_qo_heads=num_heads, num_kv_heads=num_kv_heads, head_dim_qk=head_dim, causal=False, sm_scale=sm_scale)
++            prefix_out, prefix_lse = prefix_wrapper.run(q_chunk, k_all[:prefix_len], v_all[:prefix_len], return_lse=True)
++            merged_out, _ = merge_state(current_out, current_lse, prefix_out, prefix_lse)
++            cascade_outputs.append(merged_out)
++
++    step_diffs = [(ref_outputs[i] - cascade_outputs[i]).abs().max().item() for i in range(num_steps)]
++    max_diff = max(step_diffs)
++    precision_ok = max_diff < tol
++
++    if verbose:
++        for i, d in enumerate(step_diffs):
++            print(f"  step {i}: max_diff = {d:.6f}")
++        status = "PASS" if precision_ok else "FAIL"
++        print(f"  Overall: max_diff={max_diff:.6f} [{status}]")
++
++    assert precision_ok, f"SGLang vs Block Extend cascade precision failed: max_diff={max_diff}"
++    return {"precision_ok": precision_ok, "max_diff": max_diff, "step_diffs": step_diffs}
+\ No newline at end of file
