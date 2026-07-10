@@ -155,6 +155,7 @@ def get_block_extend_module_with_offset(
     dtype: torch.dtype = torch.float16,
     backend: str = "fa2",
     device: Optional[torch.device] = None,
+    use_profiler: bool = False,
 ):
     """
     Get Block Extend Attention module with q_offset/kv_offset support
@@ -184,11 +185,13 @@ def get_block_extend_module_with_offset(
             "Use backend='fa2' for older architectures."
         )
     
-    cache_key = (head_dim, dtype, backend, device)
+    cache_key = (head_dim, dtype, backend, device, use_profiler)
     if cache_key in _MODULE_CACHE_WITH_OFFSET:
         return _MODULE_CACHE_WITH_OFFSET[cache_key]
     
-    uri = _get_module_uri_with_offset(head_dim, dtype, backend)
+    uri = _get_module_uri_with_offset(head_dim, dtype, backend) + (
+        "_profiler_true" if use_profiler else ""
+    )
     
     # AOT mode
     if _check_aot_available(uri):
@@ -227,6 +230,7 @@ def get_block_extend_module_with_offset(
         variant_name=variant_name,
         variant_decl=variant_decl,
         mask_modes=[4],  # kBlockExpanding = 4
+        use_profiler=use_profiler,
     )
     module = spec.build_and_load()
     
@@ -296,7 +300,7 @@ def block_extend_attention_with_offset(
         backend = "fa3" if is_sm90a_supported(q.device) else "fa2"
     
     module = get_block_extend_module_with_offset(head_dim=head_dim, dtype=dtype, backend=backend, device=q.device)
-    
+
     return single_prefill_with_kv_cache_with_jit_module(
         module,
         q, k, v,
@@ -304,6 +308,50 @@ def block_extend_attention_with_offset(
         dllm_block_size,
         q_offset,
         kv_offset,
+        mask_mode=MaskMode.BLOCK_EXPANDING.value,
+        return_lse=return_lse,
+    )
+
+
+@flashinfer_api
+def block_extend_attention_with_offset_profiler(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    dllm_block_size: int,
+    profiler_buffer: torch.Tensor,
+    q_offset: int = 0,
+    kv_offset: int = 0,
+    sm_scale: Optional[float] = None,
+    return_lse: bool = False,
+    backend: str = "fa3",
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    """Block-extend attention (with offset) under the in-kernel profiler.
+
+    Same computation as :func:`block_extend_attention_with_offset` but builds the
+    FA3 module with ``-DFLASHINFER_ENABLE_PROFILER`` and appends ``profiler_buffer``
+    as the trailing FFI tensor so the kernel's per-CTA event timing is captured.
+    """
+    head_dim = q.size(-1)
+    dtype = q.dtype
+    if sm_scale is None:
+        sm_scale = 1.0 / math.sqrt(head_dim)
+    if backend == "auto":
+        backend = "fa3" if is_sm90a_supported(q.device) else "fa2"
+
+    module = get_block_extend_module_with_offset(
+        head_dim=head_dim, dtype=dtype, backend=backend, device=q.device, use_profiler=True
+    )
+    # FA3 block-extend FFI trailing args: sm_scale, dllm_block_size, q_offset, kv_offset,
+    # then the profiler buffer is appended last by the profiler-enabled module.
+    return single_prefill_with_kv_cache_with_jit_module(
+        module,
+        q, k, v,
+        sm_scale,
+        dllm_block_size,
+        q_offset,
+        kv_offset,
+        profiler_buffer,
         mask_mode=MaskMode.BLOCK_EXPANDING.value,
         return_lse=return_lse,
     )

@@ -326,6 +326,7 @@ def get_single_prefill_uri(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
+    use_profiler: bool = False,
 ) -> str:
     return (
         f"single_prefill_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
@@ -337,6 +338,7 @@ def get_single_prefill_uri(
         f"use_swa_{use_sliding_window}_"
         f"use_logits_cap_{use_logits_soft_cap}_"
         f"f16qk_{use_fp16_qk_reduction}" + ("_sm90" if backend == "fa3" else "")
+        + (f"_profiler_{str(use_profiler).lower()}" if use_profiler else "")
     )
 
 
@@ -498,6 +500,7 @@ def gen_single_prefill_module(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
+    use_profiler: bool = False,
 ) -> JitSpec:
     uri = get_single_prefill_uri(
         backend,
@@ -510,6 +513,7 @@ def gen_single_prefill_module(
         use_sliding_window,
         use_logits_soft_cap,
         use_fp16_qk_reduction,
+        use_profiler,
     )
 
     # use `fp8_enabled` flag to use separate kernel template
@@ -584,6 +588,7 @@ def gen_single_prefill_module(
         use_logits_soft_cap=use_logits_soft_cap,
         use_fp16_qk_reduction=use_fp16_qk_reduction,
         fp8_enabled=fp8_enabled,
+        use_profiler=use_profiler,
     )
 
 
@@ -1315,6 +1320,7 @@ def gen_customize_single_prefill_module(
     use_fp16_qk_reduction: bool = False,
     fp8_enabled: bool = False,
     mask_modes: Optional[List[int]] = None,
+    use_profiler: bool = False,
 ) -> JitSpec:
     kwargs = {
         "variant_decl": variant_decl,
@@ -1328,6 +1334,7 @@ def gen_customize_single_prefill_module(
         "use_sliding_window": str(use_sliding_window).lower(),
         "use_logits_soft_cap": str(use_logits_soft_cap).lower(),
         "use_fp16_qk_reduction": str(use_fp16_qk_reduction).lower(),
+        "use_profiler": use_profiler,
     }
     if backend == "auto":
         raise ValueError("backend should not be auto when jit_args is provided")
@@ -1461,7 +1468,8 @@ def gen_customize_single_prefill_module(
         return gen_jit_spec(
             uri,
             source_paths,
-            extra_cuda_cflags=sm90a_nvcc_flags,
+            extra_cuda_cflags=sm90a_nvcc_flags
+            + (["-DFLASHINFER_ENABLE_PROFILER"] if use_profiler else []),
         )
     else:
         raise ValueError(f"Invalid backend: {backend}")

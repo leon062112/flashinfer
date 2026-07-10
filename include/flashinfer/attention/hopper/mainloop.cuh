@@ -13,6 +13,7 @@
 #include <cutlass/numeric_types.h>
 
 #include "../../math.cuh"
+#include "../../profiler.cuh"
 #include "cute/tensor.hpp"
 #include "cutlass/gemm/collective/collective_builder.hpp"
 #include "cutlass/pipeline/pipeline.hpp"
@@ -195,7 +196,8 @@ struct CollectiveMainloop {
                            PipelineState& smem_pipe_write_v, SharedStorage& shared_storage,
                            Scheduler& scheduler, typename Scheduler::Params const& scheduler_params,
                            typename Scheduler::WorkTileInfo& work_tile_info,
-                           BlockCoord const& block_coord, int work_idx) {
+                           BlockCoord const& block_coord, int work_idx
+                           PROFILER_CLOSURE_FUNC_PARAMS) {
     Tensor sQ = make_tensor(make_smem_ptr(shared_storage.smem_q.data()), SmemLayoutQ{});
     Tensor sK = make_tensor(make_smem_ptr(shared_storage.smem_k.data()), SmemLayoutK{});
     Tensor sV = make_tensor(make_smem_ptr(shared_storage.smem_v.data()), SmemLayoutV{});
@@ -238,9 +240,11 @@ struct CollectiveMainloop {
     int lane_predicate = cute::elect_one_sync();
     if (lane_predicate) {
       pipeline_k.producer_acquire(smem_pipe_write_k);
+      PROFILER_EVENT_START(profiler_closure, SinglePrefillProfileEventType::kTmaLoadK);
       copy(mainloop_params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write_k),
                                            /*mcast_mask=*/0),
            tKgK(_, kv_tile_idx), tKsK(_, smem_pipe_write_k.index()));
+      PROFILER_EVENT_END(profiler_closure, SinglePrefillProfileEventType::kTmaLoadK);
       ++smem_pipe_write_k;
     }
 
@@ -267,24 +271,30 @@ struct CollectiveMainloop {
 #pragma unroll 2
       for (; kv_tile_idx > swa_begin_kv_tile_idx; --kv_tile_idx) {
         pipeline_k.producer_acquire(smem_pipe_write_k);
+        PROFILER_EVENT_START(profiler_closure, SinglePrefillProfileEventType::kTmaLoadK);
         copy(mainloop_params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write_k),
                                              /*mcast_mask=*/0),
              tKgK(_, kv_tile_idx - 1), tKsK(_, smem_pipe_write_k.index()));
+        PROFILER_EVENT_END(profiler_closure, SinglePrefillProfileEventType::kTmaLoadK);
         ++smem_pipe_write_k;
         pipeline_v.producer_acquire(smem_pipe_write_v);
+        PROFILER_EVENT_START(profiler_closure, SinglePrefillProfileEventType::kTmaLoadV);
         copy(mainloop_params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write_v),
                                              /*mcast_mask=*/0),
              tVgV(_, kv_tile_idx), tVsV(_, smem_pipe_write_v.index()));
+        PROFILER_EVENT_END(profiler_closure, SinglePrefillProfileEventType::kTmaLoadV);
         ++smem_pipe_write_v;
       }
     }
     scheduler.prefetch_next_work(scheduler_params, work_tile_info);
     if (lane_predicate) {
       pipeline_v.producer_acquire(smem_pipe_write_v);
-      copy(mainloop_params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write_v),
-                                           /*mcast_mask=*/0),
-           tVgV(_, kv_tile_idx), tVsV(_, smem_pipe_write_v.index()));
-      ++smem_pipe_write_v;
+      PROFILER_EVENT_START(profiler_closure, SinglePrefillProfileEventType::kTmaLoadV);
+copy(mainloop_params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write_v),
+                                     /*mcast_mask=*/0),
+     tVgV(_, kv_tile_idx), tVsV(_, smem_pipe_write_v.index()));
+PROFILER_EVENT_END(profiler_closure, SinglePrefillProfileEventType::kTmaLoadV);
+++smem_pipe_write_v;
     }
     scheduler.broadcast_next_work(work_tile_info);
   }

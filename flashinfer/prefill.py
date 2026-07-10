@@ -1093,6 +1093,95 @@ def single_prefill_with_kv_cache_with_jit_module(
     return (o, lse) if return_lse else o
 
 
+@functools.cache
+def _get_single_prefill_profiler_module(
+    backend,
+    dtype_q,
+    dtype_kv,
+    dtype_o,
+    head_dim_qk,
+    head_dim_vo,
+    pos_encoding_mode,
+    use_sliding_window,
+    use_logits_soft_cap,
+    use_fp16_qk_reduction,
+):
+    """Build (and cache) a single-prefill JIT module with the in-kernel profiler
+    enabled. Returns the raw JIT module so callers can invoke ``module.run(...)``
+    directly with a trailing ``profiler_buffer`` tensor."""
+    return gen_single_prefill_module(
+        backend,
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        head_dim_qk,
+        head_dim_vo,
+        pos_encoding_mode,
+        use_sliding_window,
+        use_logits_soft_cap,
+        use_fp16_qk_reduction,
+        use_profiler=True,
+    ).build_and_load()
+
+
+def single_prefill_with_kv_cache_profiler(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    packed_custom_mask: torch.Tensor,
+    profiler_buffer: torch.Tensor,
+    sm_scale: float,
+    kv_layout: str = "NHD",
+    window_left: int = -1,
+    logits_soft_cap: float = 0.0,
+    use_fp16_qk_reduction: bool = False,
+    return_lse: bool = False,
+):
+    """Run FA3 single-prefill with a custom (packed-bitmask) mask under the
+    in-kernel profiler. The compiled module carries ``-DFLASHINFER_ENABLE_PROFILER``
+    and appends ``profiler_buffer`` as the trailing FFI tensor arg.
+
+    Mirrors the FA3 non-FP8 custom-mask run path of
+    :func:`single_prefill_with_kv_cache` but routes through the profiler-enabled
+    module + :func:`single_prefill_with_kv_cache_with_jit_module` so the
+    ``profiler_buffer`` lands in the kernel's ``additional_params.profiler_buffer``.
+    """
+    assert not is_float8(q), "profiler path supports non-FP8 only"
+    module = _get_single_prefill_profiler_module(
+        "fa3",
+        q.dtype,
+        k.dtype,
+        q.dtype,
+        q.shape[-1],
+        v.shape[-1],
+        PosEncodingMode["NONE"].value,
+        window_left >= 0,
+        logits_soft_cap > 0,
+        use_fp16_qk_reduction,
+    )
+    # FA3 non-FP8 custom-mask FFI trailing args (see single_prefill_with_kv_cache):
+    #   maybe_packed_custom_mask, maybe_scale_v, logits_soft_cap, sm_scale, scale_v_scalar
+    # then the profiler buffer is appended last by the profiler-enabled module.
+    scale_v_tensor = None
+    scale_v_scalar = 1.0
+    return single_prefill_with_kv_cache_with_jit_module(
+        module,
+        q,
+        k,
+        v,
+        packed_custom_mask,
+        scale_v_tensor,
+        logits_soft_cap,
+        sm_scale,
+        scale_v_scalar,
+        profiler_buffer,
+        kv_layout=kv_layout,
+        mask_mode=MaskMode.CUSTOM.value,
+        window_left=window_left,
+        return_lse=return_lse,
+    )
+
+
 @overload
 def single_prefill_with_kv_cache(
     q: torch.Tensor,

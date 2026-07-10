@@ -1,5 +1,6 @@
 from .block_extend import (
     block_extend_attention_with_offset,
+    block_extend_attention_with_offset_profiler,
     block_extend_cascade,
     get_block_extend_module_with_offset,
     BLOCK_EXTEND_V2_WITH_OFFSET_VARIANT_DECL,
@@ -27,6 +28,7 @@ __all__ = [
     "_BATCH_BE_OFFSET_VARIANT_DECL_FA3",
     "batch_block_extend_cascade",
     "block_extend_attention_with_offset",
+    "block_extend_attention_with_offset_profiler",
     "block_extend_cascade",
     "get_block_extend_module_with_offset",
     "sglang_style_cascade_attention",

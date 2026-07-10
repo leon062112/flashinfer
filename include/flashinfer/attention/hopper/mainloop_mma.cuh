@@ -12,10 +12,42 @@
 #include <cutlass/numeric_conversion.h>
 #include <cutlass/numeric_types.h>
 #include "../../utils.cuh"
+#include "../../profiler.cuh"
 
 #include "variants.cuh"
 
 namespace flashinfer {
+
+// Profiler event types for the FA3 single-prefill kernel.
+// Producer (TMA load) events are emitted in mainloop.cuh::load();
+// consumer (compute) events are emitted in mma_f16 and prefill_sm90.cuh.
+// Indexed positionally by the Python-side event_names list.
+//   kTmaLoadK     -> copy(tma_load_K)  (producer)
+//   kTmaLoadV     -> copy(tma_load_V)  (producer)
+//   kGemmQK       -> tiled_mma_qk (consumer)
+//   kMaskApply    -> LogitsTransform + mask (consumer)
+//   kSoftmaxMerge -> attention_updater.update + pipeline release (consumer)
+//   kGemmPV       -> tiled_mma_pv (consumer)
+//   kWriteO       -> collective_epilogue.store (consumer)
+enum class SinglePrefillProfileEventType {
+  kTmaLoadK = 0U,
+  kTmaLoadV = 1U,
+  kGemmQK = 2U,
+  kMaskApply = 3U,
+  kSoftmaxMerge = 4U,
+  kGemmPV = 5U,
+  kWriteO = 6U,
+};
+
+#ifdef FLASHINFER_ENABLE_PROFILER
+// Per-CTA profiler scratch for the single-prefill path. Defined here (rather
+// than in prefill_sm90.cuh) because mainloop_mma.cuh is also included
+// transitively by mainloop.cuh, which is included before the body of
+// prefill_sm90.cuh.
+struct ProfilerClosure {
+  PROFILER_CLOSURE_PARAMS_DECL
+};
+#endif
 
 template <typename Ktraits, bool LEFT_SLIDING_WINDOW, bool CAUSAL, bool BLOCK_EXPANDING, bool MULTIITEMSCORING,
           typename WarpScheduler, bool USE_CUSTOM_MASK, typename AttentionVariant, typename Params,
@@ -28,7 +60,12 @@ CUTLASS_DEVICE void mma_f16(
     int swa_begin_kv_tile_idx, int swa_end_kv_tile_idx, int thread_idx, int work_idx,
     int q_tile_idx, SharedStorage& shared_storage, const int32_t qo_len, const int32_t kv_len,
     const int32_t qo_head_idx, const int32_t kv_head_idx, const int32_t batch_idx, const uint32_t prefix_len,
-    uint16_t* token_pos_in_items, const int num_kv_tiles_outside_items_window = 0,
+    uint16_t* token_pos_in_items
+#ifdef FLASHINFER_ENABLE_PROFILER
+    , ProfilerClosure& profiler_closure
+#endif
+    ,
+    const int num_kv_tiles_outside_items_window = 0,
     const int num_kv_tiles_prefix = 0) {
   using DTypeQ = typename Ktraits::DTypeQ;
   using DTypeKV = typename Ktraits::DTypeKV;
@@ -317,12 +354,17 @@ CUTLASS_DEVICE void mma_f16(
     Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_QKD{}));
     consumer_wait(pipeline_k, smem_pipe_read_k);
     WarpScheduler::barrier_sync();
+    PROFILER_EVENT_START(profiler_closure, SinglePrefillProfileEventType::kGemmQK);
     gemm</*init=*/true, /*wg_wait=*/-1>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read_k.index()),
                                         tSrS);
+    PROFILER_EVENT_END(profiler_closure, SinglePrefillProfileEventType::kGemmQK);
     attention_updater.rescale_o(tOrO);
     consumer_wait(pipeline_v, smem_pipe_read_v);
+    PROFILER_EVENT_START(profiler_closure, SinglePrefillProfileEventType::kGemmPV);
     gemm</*init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, tOrP,
                                          tOrV(_, _, _, smem_pipe_read_v.index()), tOrO);
+    PROFILER_EVENT_END(profiler_closure, SinglePrefillProfileEventType::kGemmPV);
+    PROFILER_EVENT_START(profiler_closure, SinglePrefillProfileEventType::kMaskApply);
     WarpScheduler::barrier_arrive();
     warpgroup_wait<1>();
     pipeline_k.consumer_release(smem_pipe_read_k);  // release K
@@ -354,6 +396,8 @@ CUTLASS_DEVICE void mma_f16(
         }
       }
     }
+    PROFILER_EVENT_END(profiler_closure, SinglePrefillProfileEventType::kMaskApply);
+    PROFILER_EVENT_START(profiler_closure, SinglePrefillProfileEventType::kSoftmaxMerge);
     attention_updater.update</*init=*/false>(tSrS);
     warpgroup_wait<0>();
     pipeline_v.consumer_release(smem_pipe_read_v);  // release V
@@ -362,6 +406,7 @@ CUTLASS_DEVICE void mma_f16(
     cute::copy(make_tensor(convert_type<DTypeKV>(tSrS).data(),
                            convert_layout_acc_Aregs<typename Ktraits::TiledMmaPV>(tSrS.layout())),
                tOrP);
+    PROFILER_EVENT_END(profiler_closure, SinglePrefillProfileEventType::kSoftmaxMerge);
   }
 
   if constexpr (LEFT_SLIDING_WINDOW) {

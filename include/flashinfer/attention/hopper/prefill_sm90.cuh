@@ -20,13 +20,13 @@
 
 #include "../../cutlass_utils.cuh"
 #include "../../exception.h"
+#include "../../profiler.cuh"
 #include "../mask.cuh"
 #include "cute/tensor.hpp"
 #include "cutlass/pipeline/pipeline.hpp"
 #include "epilogue.cuh"
 #include "kernel_traits.cuh"
 #include "mainloop.cuh"
-#include "mainloop_mma.cuh"
 #include "sparse_mainloop.cuh"
 #include "tile_scheduler.cuh"
 #include "utils.cuh"
@@ -152,6 +152,25 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
       cutlass::arch::warpgroup_reg_dealloc<72>();
     }
 
+#ifdef FLASHINFER_ENABLE_PROFILER
+    // Producer profiler init — independent from consumer.
+    // Uses group_idx=0, num_groups=2 (consumer uses group_idx=1).
+    ProfilerClosure profiler_closure;
+    uint64_t* _prod_profiler_buffer = mainloop_params.additional_params.profiler_buffer;
+    bool _prod_profiler_enabled = (_prod_profiler_buffer != nullptr);
+    if (_prod_profiler_enabled) {
+      uint32_t _prod_sm_idx;
+      asm volatile("mov.u32 %0, %smid;" : "=r"(_prod_sm_idx));
+      profiler_closure.profiler_write_ptr =
+          _prod_profiler_buffer + 1 + get_block_idx() * 2 + 0;
+      profiler_closure.profiler_write_stride = get_num_blocks() * 2;
+      profiler_closure.profiler_entry_tag_base =
+          encode_tag(_prod_sm_idx, get_block_idx() * 2 + 0, 0, 0);
+      // Producer uses thread 0 (first thread in warpgroup 0).
+      profiler_closure.profiler_write_thread_predicate = (threadIdx.x == 0);
+    }
+#endif
+
     int warp_idx_in_warpgroup = __shfl_sync(0xffffffff, (threadIdx.x / 32) % 4, 0);
     if (!use_tma_load_kv || warp_idx_in_warpgroup == 0) {  // Load Q, K, V
       PipelineState smem_pipe_write_k = cutlass::make_producer_start_state<MainloopPipeline>();
@@ -192,11 +211,19 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
           collective_mainloop.load<LEFT_SLIDING_WINDOW>(
               mainloop_params, pipeline_k, pipeline_v, smem_pipe_write_k, smem_pipe_write_v,
               shared_storage, scheduler, scheduler_params, work_tile_info, block_coord, work_idx,
-              num_kv_tiles_outside_items_window, num_kv_tiles_prefix);
+              num_kv_tiles_outside_items_window, num_kv_tiles_prefix
+#ifdef FLASHINFER_ENABLE_PROFILER
+              , profiler_closure
+#endif
+          );
         } else {
           collective_mainloop.template load<LEFT_SLIDING_WINDOW>(
               mainloop_params, pipeline_k, pipeline_v, smem_pipe_write_k, smem_pipe_write_v,
-              shared_storage, scheduler, scheduler_params, work_tile_info, block_coord, work_idx);
+              shared_storage, scheduler, scheduler_params, work_tile_info, block_coord, work_idx
+#ifdef FLASHINFER_ENABLE_PROFILER
+              , profiler_closure
+#endif
+          );
         }
         ++work_idx;
       }
@@ -219,6 +246,39 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
 
     CollectiveMainloop::WarpScheduler::mma_init();
     scheduler.init_consumer();
+
+#ifdef FLASHINFER_ENABLE_PROFILER
+    // In-kernel profiler init for the single-prefill path. We read the buffer
+    // from mainloop_params.additional_params.profiler_buffer (set by the
+    // launcher) instead of the macro's default params.profiler_buffer, so the
+    // shared CollectiveMainloop::Params struct in mainloop.cuh stays untouched.
+    // Only the consumer warpgroup's thread 0 writes events (one writer per CTA,
+    // matching the persistent kernel's convention). The profiler_buffer field is
+    // declared on AdditionalParams only under this #ifdef (see the config jinja),
+    // so it is always present here.
+    ProfilerClosure profiler_closure;
+    uint64_t* _profiler_buffer = mainloop_params.additional_params.profiler_buffer;
+    bool _profiler_enabled = (_profiler_buffer != nullptr);
+    // This whole block runs in the *consumer* warpgroup (wg != 0), whose threads
+    // start at threadIdx.x == NUM_COPY_THREADS. Pick the consumer's thread 0 as
+    // the single writer per CTA (and the header writer on block 0).
+    if (_profiler_enabled) {
+      uint32_t _sm_idx;
+      asm volatile("mov.u32 %0, %smid;" : "=r"(_sm_idx));
+      if (get_block_idx() == 0 && threadIdx.x == NUM_COPY_THREADS) {
+        profiler_closure.entry.nblocks = get_num_blocks();
+        profiler_closure.entry.ngroups = 2;
+        _profiler_buffer[0] = profiler_closure.entry.raw;
+      }
+      // group_idx=0, num_groups=1: one group per CTA.
+      profiler_closure.profiler_write_ptr =
+          _profiler_buffer + 1 + get_block_idx() * 2 + 1;
+      profiler_closure.profiler_write_stride = get_num_blocks() * 2;
+      profiler_closure.profiler_entry_tag_base =
+          encode_tag(_sm_idx, get_block_idx() * 2 + 1, 0, 0);
+      profiler_closure.profiler_write_thread_predicate = (threadIdx.x == NUM_COPY_THREADS);
+    }
+#endif
 
     int work_idx = 0;
     CUTLASS_PRAGMA_NO_UNROLL
@@ -278,10 +338,24 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
           mainloop_params, variant, pipeline_k, pipeline_v, smem_pipe_read_k, smem_pipe_read_v,
           tOrO, attention_updater, num_kv_tiles, swa_begin_kv_tile_idx, swa_end_kv_tile_idx,
           threadIdx.x - NUM_COPY_THREADS, work_idx, q_tile_idx, shared_storage, qo_len, kv_len,
-          qo_head_idx, kv_head_idx, batch_idx, prefix_len, token_pos_in_items,
+          qo_head_idx, kv_head_idx, batch_idx, prefix_len, token_pos_in_items
+#ifdef FLASHINFER_ENABLE_PROFILER
+          , profiler_closure
+#endif
+          ,
           num_kv_tiles_outside_items_window, num_kv_tiles_prefix);
+#ifdef FLASHINFER_ENABLE_PROFILER
+      if (_profiler_enabled) {
+        PROFILER_EVENT_START(profiler_closure, SinglePrefillProfileEventType::kWriteO);
+      }
+#endif
       collective_epilogue.store(epilogue_params, tOrO, attention_updater.get_lse(), shared_storage,
                                 tiled_mma_pv, threadIdx.x - NUM_COPY_THREADS, block_coord);
+#ifdef FLASHINFER_ENABLE_PROFILER
+      if (_profiler_enabled) {
+        PROFILER_EVENT_END(profiler_closure, SinglePrefillProfileEventType::kWriteO);
+      }
+#endif
 
       ++work_idx;
     }
