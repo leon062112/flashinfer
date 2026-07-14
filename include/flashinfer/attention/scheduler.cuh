@@ -497,7 +497,8 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
                                    uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t head_dim,
                                    uint32_t page_size, uint32_t max_batch_size_if_split,
                                    bool enable_cuda_graph, int32_t window_left,
-                                   int32_t fixed_split_size, bool disable_split_kv) {
+                                   int32_t fixed_split_size, bool disable_split_kv,
+                                   int64_t mask_mode, int64_t dllm_block_size) {
   std::vector<IdType> request_indices, qo_tile_indices, kv_tile_indices, merge_indptr, o_indptr;
   merge_indptr.push_back(0);
   o_indptr.push_back(0);
@@ -554,13 +555,27 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
     }
   }
 
-  // Calculate the actual needed CTA when considering sliding window
+  // Calculate the actual needed CTA when considering mask mode
   std::vector<int64_t> effective_kv_len_arr(batch_size);
   for (uint32_t i = 0; i < batch_size; ++i) {
-    // pad CTA_TILE_Q to consider the causal kv-len
-    effective_kv_len_arr[i] =
-        std::min(window_left >= 0 ? ceil_div(window_left + cta_tile_q, page_size) : kv_len_arr[i],
-                 kv_len_arr[i]);
+    // BLOCK_EXPANDING mask: mask[q, k] = (q_global / B) >= (kv_global / B)
+    // For the last Q token in a batch item, KV up to the end of its block is visible.
+    // KV positions beyond that block are completely masked and can be pruned.
+    if (mask_mode == 4 && dllm_block_size > 0) {
+      // qo_len in tokens (undo packed_qo_len = qo_len * gqa_group_size)
+      int64_t qo_len_tokens = packed_qo_len_arr[i] / int64_t(gqa_group_size);
+      // last Q token lives in block: (qo_len_tokens - 1) / dllm_block_size
+      // visible KV ends at: (q_last_block + 1) * dllm_block_size tokens → pages
+      int64_t q_last_block = (qo_len_tokens > 0) ? (qo_len_tokens - 1) / dllm_block_size : 0;
+      int64_t max_kv_global_tokens = (q_last_block + 1) * dllm_block_size;
+      int64_t block_kv_end_pages = ceil_div(max_kv_global_tokens, (int64_t)page_size);
+      effective_kv_len_arr[i] = std::min(block_kv_end_pages, kv_len_arr[i]);
+    } else {
+      // pad CTA_TILE_Q to consider the causal kv-len
+      effective_kv_len_arr[i] =
+          std::min(window_left >= 0 ? ceil_div(window_left + cta_tile_q, page_size) : kv_len_arr[i],
+                   kv_len_arr[i]);
+    }
   }
   bool split_kv = false;
   int64_t kv_chunk_size;
@@ -699,6 +714,7 @@ inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_i
                                uint32_t head_dim_qk, uint32_t head_dim_vo, uint32_t page_size,
                                bool enable_cuda_graph, uint32_t sizeof_dtype_o, int32_t window_left,
                                int32_t fixed_split_size, bool disable_split_kv,
+                               int64_t mask_mode, int64_t dllm_block_size,
                                int64_t num_colocated_ctas,  // for POD attention, limit prefill
                                                             // splits by #colocated decode CTAs
                                cudaStream_t stream) {
@@ -724,7 +740,8 @@ inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_i
         qo_tile_indices_vec, kv_tile_indices_vec, merge_indptr_vec, o_indptr_vec] =
       PrefillSplitQOKVIndptr(qo_indptr_h, kv_indptr_h, total_num_rows, batch_size, num_qo_heads,
                              num_kv_heads, head_dim_vo, page_size, max_batch_size_if_split,
-                             enable_cuda_graph, window_left, fixed_split_size, disable_split_kv);
+                             enable_cuda_graph, window_left, fixed_split_size, disable_split_kv,
+                             mask_mode, dllm_block_size);
 
   plan_info.cta_tile_q = cta_tile_q;
   plan_info.total_num_rows = total_num_rows;

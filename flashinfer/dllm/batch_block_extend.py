@@ -381,6 +381,7 @@ class BatchBlockExtendPagedOffsetWrapper:
             head_dim_qk=head_dim, head_dim_vo=head_dim, page_size=page_size,
             causal=False, pos_encoding_mode="NONE",
             q_data_type=q_data_type, mask_mode=MaskMode.BLOCK_EXPANDING.value,
+            dllm_block_size=self._dllm_block_size,
         )
     
     def run(
@@ -515,6 +516,7 @@ class BatchBlockExtendRaggedOffsetWrapper:
             head_dim_qk=head_dim, head_dim_vo=head_dim,
             causal=False, pos_encoding_mode="NONE",
             q_data_type=q_data_type, mask_mode=MaskMode.BLOCK_EXPANDING.value,
+            dllm_block_size=self._dllm_block_size,
         )
     
     def run(

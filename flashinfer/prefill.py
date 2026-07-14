@@ -1802,6 +1802,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         fixed_split_size: Optional[int] = None,
         disable_split_kv: bool = False,
         mask_mode: Optional[int] = None,
+        dllm_block_size: Optional[int] = None,
     ) -> None:
         r"""Plan batch prefill/append attention on Paged KV-Cache for given problem specification.
 
@@ -2155,6 +2156,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 args.append(fixed_split_size or -1)  # fixed_split_size
                 args.append(disable_split_kv)  # disable_split_kv
                 args.append(0)  # num_colocated_ctas
+                args.append(mask_mode if mask_mode is not None else 0)  # mask_mode for plan
+                args.append(dllm_block_size if dllm_block_size is not None else 0)  # dllm_block_size for plan
             self._plan_info = self._cached_module.plan(
                 *args,
             )
@@ -2911,6 +2914,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         max_sequence_kv: Optional[int] = None,
         v_indptr: Optional[torch.Tensor] = None,
         o_indptr: Optional[torch.Tensor] = None,
+        dllm_block_size: Optional[int] = None,
     ) -> None:
         r"""Plan batch prefill/append attention on Ragged KV-Cache for given problem specification.
 
@@ -3249,6 +3253,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 args.append(fixed_split_size or -1)  # fixed_split_size
                 args.append(disable_split_kv)  # disable_split_kv
                 args.append(0)  # num_colocated_ctas
+                args.append(mask_mode if mask_mode is not None else 0)  # mask_mode for plan
+                args.append(dllm_block_size if dllm_block_size is not None else 0)  # dllm_block_size for plan
             self._plan_info = self._cached_module.plan(
                 *args,
             )
