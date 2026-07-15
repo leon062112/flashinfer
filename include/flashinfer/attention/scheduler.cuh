@@ -890,7 +890,8 @@ inline cudaError_t PrefillSM90Plan(
     PrefillPlanSM90Info& plan_info, IdType* qo_indptr_h, IdType* kv_indptr_h, IdType* kv_len_arr_h,
     uint32_t total_num_rows, uint32_t batch_size, uint32_t num_qo_heads, uint32_t num_kv_heads,
     uint32_t head_dim_qk, uint32_t head_dim_vo, uint32_t page_size, bool causal,
-    bool enable_cuda_graph, uint32_t sizeof_dtype_o, cudaStream_t stream) {
+    bool enable_cuda_graph, uint32_t sizeof_dtype_o, int64_t mask_mode,
+    int64_t dllm_block_size, cudaStream_t stream) {
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads " << num_qo_heads << " should be divisible by num_kv_heads "
@@ -949,9 +950,20 @@ inline cudaError_t PrefillSM90Plan(
         auto [cta_idx, accum_cost] = cta_cost_heap.pop();
         // NOTE(Zihao): our current FA3 implementation do not fuse query and group heads
         // so the group_size in cost_function is always 1
-        int effective_kv_len =
-            causal ? packed_causal_kv_end(qo_len, kv_len, qo_tile_idx, cta_tile_q, num_qo_tiles, 1)
-                   : kv_len;
+        int effective_kv_len;
+        if (mask_mode == 4 && dllm_block_size > 0) {
+          // BLOCK_EXPANDING: mask[q, k] = (q_global / B) >= (kv_global / B)
+          // For this Q tile [q_start, q_end), the last Q position's block determines visible KV.
+          int q_tile_end = std::min((qo_tile_idx + 1) * cta_tile_q, qo_len);
+          int q_last_block = (q_tile_end > 0) ? (q_tile_end - 1) / (int)dllm_block_size : 0;
+          int max_visible_kv = (q_last_block + 1) * (int)dllm_block_size;
+          effective_kv_len = std::min(max_visible_kv, kv_len);
+        } else if (causal) {
+          effective_kv_len =
+              packed_causal_kv_end(qo_len, kv_len, qo_tile_idx, cta_tile_q, num_qo_tiles, 1);
+        } else {
+          effective_kv_len = kv_len;
+        }
         cta_cost_heap.insert({cta_idx, accum_cost + cost_function(cta_tile_q, effective_kv_len)});
         cta_qo_tile_indices[cta_idx].push_back(qo_tile_idx);
         cta_qo_indptr[cta_idx].push_back(qo_indptr_h[i]);

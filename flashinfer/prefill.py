@@ -2156,6 +2156,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 args.append(fixed_split_size or -1)  # fixed_split_size
                 args.append(disable_split_kv)  # disable_split_kv
                 args.append(0)  # num_colocated_ctas
+            if self._backend in ("fa2", "fa3"):
                 args.append(mask_mode if mask_mode is not None else 0)  # mask_mode for plan
                 args.append(dllm_block_size if dllm_block_size is not None else 0)  # dllm_block_size for plan
             self._plan_info = self._cached_module.plan(
@@ -3253,6 +3254,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 args.append(fixed_split_size or -1)  # fixed_split_size
                 args.append(disable_split_kv)  # disable_split_kv
                 args.append(0)  # num_colocated_ctas
+            if self._backend in ("fa2", "fa3"):
                 args.append(mask_mode if mask_mode is not None else 0)  # mask_mode for plan
                 args.append(dllm_block_size if dllm_block_size is not None else 0)  # dllm_block_size for plan
             self._plan_info = self._cached_module.plan(
