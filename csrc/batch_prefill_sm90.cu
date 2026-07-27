@@ -48,7 +48,8 @@ Array<int64_t> BatchPrefillWithKVCacheSM90Plan(
     ffi::TensorView kv_indptr, ffi::TensorView kv_len_arr, int64_t total_num_rows,
     int64_t batch_size, int64_t num_qo_heads, int64_t num_kv_heads, int64_t page_size,
     bool enable_cuda_graph, int64_t head_dim_qk, int64_t head_dim_vo, bool causal,
-    int64_t window_left) {
+    int64_t window_left, int64_t mask_mode = 0, int64_t dllm_block_size = 0,
+    ffi::Optional<ffi::TensorView> q_offsets = ffi::Optional<ffi::TensorView>()) {
   size_t float_workspace_size_in_bytes =
       float_workspace_buffer.size(0) * get_element_size(float_workspace_buffer);
   size_t int_workspace_size_in_bytes =
@@ -66,7 +67,8 @@ Array<int64_t> BatchPrefillWithKVCacheSM90Plan(
       static_cast<IdType*>(kv_indptr.data_ptr()), static_cast<IdType*>(kv_len_arr.data_ptr()),
       total_num_rows, batch_size, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo, page_size,
       causal, enable_cuda_graph,
-      /*sizeof_dtype_o=*/2, stream);
+      /*sizeof_dtype_o=*/2, stream, mask_mode, dllm_block_size,
+      q_offsets.has_value() ? static_cast<IdType*>(q_offsets.value().data_ptr()) : nullptr);
 
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "PrefillSM90Plan failed with error: " << cudaGetErrorString(status);

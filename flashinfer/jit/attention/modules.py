@@ -1390,7 +1390,9 @@ def _customize_prefill_dispatch_context(
             "  DISPATCH_MASK_MODE(mask_mode, MASK_MODE, { \\",
         ]
         if not is_sm90:
-            lines.append("    constexpr bool use_custom_mask = MASK_MODE == MaskMode::kCustom; \\")
+            lines.append(
+                "    constexpr bool use_custom_mask = MASK_MODE == MaskMode::kCustom; \\"
+            )
         lines.extend(
             [
                 f"    using AttentionVariant = {variant_name}; \\",
@@ -1427,10 +1429,24 @@ def gen_customize_single_prefill_module(
     gen_customize_block_extend_single_prefill_module (standalone dispatch;
     reviewers' §1)."""
     return _gen_customize_single_prefill_module_impl(
-        backend, uri, dtype_q, dtype_kv, dtype_o, head_dim_qk, head_dim_vo,
-        additional_tensor_names, additional_tensor_dtypes, additional_scalar_names,
-        additional_scalar_dtypes, variant_name, variant_decl, pos_encoding_mode,
-        use_sliding_window, use_logits_soft_cap, use_fp16_qk_reduction, fp8_enabled,
+        backend,
+        uri,
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        head_dim_qk,
+        head_dim_vo,
+        additional_tensor_names,
+        additional_tensor_dtypes,
+        additional_scalar_names,
+        additional_scalar_dtypes,
+        variant_name,
+        variant_decl,
+        pos_encoding_mode,
+        use_sliding_window,
+        use_logits_soft_cap,
+        use_fp16_qk_reduction,
+        fp8_enabled,
         [0, 1, 2, 3],
     )
 
@@ -1485,7 +1501,10 @@ def _gen_customize_single_prefill_module_impl(
         )
 
         kwargs["dispatch_context"] = _customize_prefill_dispatch_context(
-            variant_name, is_batch=is_batch, is_sm90=False, is_block_extend=is_block_extend
+            variant_name,
+            is_batch=is_batch,
+            is_sm90=False,
+            is_block_extend=is_block_extend,
         )
 
         with open(
@@ -1564,7 +1583,10 @@ def _gen_customize_single_prefill_module_impl(
             _file_csrc = "single_prefill_sm90.cu"
 
         kwargs["dispatch_context"] = _customize_prefill_dispatch_context(
-            variant_name, is_batch=is_batch, is_sm90=True, is_block_extend=is_block_extend
+            variant_name,
+            is_batch=is_batch,
+            is_sm90=True,
+            is_block_extend=is_block_extend,
         )
 
         with open(jit_env.FLASHINFER_CSRC_DIR / _file_config) as f:
@@ -1643,13 +1665,20 @@ def _check_block_extend_axes(
     head_dim_qk: int,
     head_dim_vo: int,
 ) -> None:
-    for name, dtype in (("dtype_q", dtype_q), ("dtype_kv", dtype_kv), ("dtype_o", dtype_o)):
+    for name, dtype in (
+        ("dtype_q", dtype_q),
+        ("dtype_kv", dtype_kv),
+        ("dtype_o", dtype_o),
+    ):
         if dtype not in _BLOCK_EXTEND_SUPPORTED_DTYPES:
             raise ValueError(
                 f"Block-extend (dLLM) only supports {_BLOCK_EXTEND_SUPPORTED_DTYPES}, "
                 f"got {name}={dtype}."
             )
-    if head_dim_qk not in _BLOCK_EXTEND_SUPPORTED_HEAD_DIMS or head_dim_vo not in _BLOCK_EXTEND_SUPPORTED_HEAD_DIMS:
+    if (
+        head_dim_qk not in _BLOCK_EXTEND_SUPPORTED_HEAD_DIMS
+        or head_dim_vo not in _BLOCK_EXTEND_SUPPORTED_HEAD_DIMS
+    ):
         raise ValueError(
             f"Block-extend (dLLM) only supports head_dim in "
             f"{sorted(_BLOCK_EXTEND_SUPPORTED_HEAD_DIMS)}, got "
@@ -1687,11 +1716,24 @@ def gen_customize_block_extend_single_prefill_module(
     """
     _check_block_extend_axes(dtype_q, dtype_kv, dtype_o, head_dim_qk, head_dim_vo)
     return _gen_customize_single_prefill_module_impl(
-        backend, uri, dtype_q, dtype_kv, dtype_o, head_dim_qk, head_dim_vo,
-        additional_tensor_names, additional_tensor_dtypes,
-        additional_scalar_names, additional_scalar_dtypes,
-        variant_name, variant_decl, pos_encoding_mode,
-        use_sliding_window, use_logits_soft_cap, use_fp16_qk_reduction, fp8_enabled,
+        backend,
+        uri,
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        head_dim_qk,
+        head_dim_vo,
+        additional_tensor_names,
+        additional_tensor_dtypes,
+        additional_scalar_names,
+        additional_scalar_dtypes,
+        variant_name,
+        variant_decl,
+        pos_encoding_mode,
+        use_sliding_window,
+        use_logits_soft_cap,
+        use_fp16_qk_reduction,
+        fp8_enabled,
         [MaskMode.BLOCK_EXTEND.value],
         is_block_extend=True,
     )
@@ -1717,6 +1759,7 @@ def gen_customize_block_extend_batch_prefill_module(
     use_logits_soft_cap: bool = False,
     use_fp16_qk_reduction: bool = False,
     fp8_enabled: bool = False,
+    use_profiler: bool = False,
 ) -> "JitSpec":
     """Dedicated batch-prefill front-end for Block Extend attention.
 
@@ -1726,14 +1769,29 @@ def gen_customize_block_extend_batch_prefill_module(
     """
     _check_block_extend_axes(dtype_q, dtype_kv, dtype_o, head_dim_qk, head_dim_vo)
     return _gen_customize_batch_prefill_module_impl(
-        backend, uri, dtype_q, dtype_kv, dtype_o, idtype, head_dim_qk, head_dim_vo,
-        additional_tensor_names, additional_tensor_dtypes,
-        additional_scalar_names, additional_scalar_dtypes,
-        variant_name, variant_decl, pos_encoding_mode,
-        use_sliding_window, use_logits_soft_cap, use_fp16_qk_reduction, fp8_enabled,
+        backend,
+        uri,
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        idtype,
+        head_dim_qk,
+        head_dim_vo,
+        additional_tensor_names,
+        additional_tensor_dtypes,
+        additional_scalar_names,
+        additional_scalar_dtypes,
+        variant_name,
+        variant_decl,
+        pos_encoding_mode,
+        use_sliding_window,
+        use_logits_soft_cap,
+        use_fp16_qk_reduction,
+        fp8_enabled,
         [MaskMode.BLOCK_EXTEND.value],
         is_block_extend=True,
         is_batch=True,
+        use_profiler=use_profiler,
     )
 
 
@@ -1848,10 +1906,25 @@ def gen_customize_batch_prefill_module(
     gen_customize_block_extend_batch_prefill_module (standalone dispatch;
     reviewers' §1)."""
     return _gen_customize_batch_prefill_module_impl(
-        backend, uri, dtype_q, dtype_kv, dtype_o, idtype, head_dim_qk, head_dim_vo,
-        additional_tensor_names, additional_tensor_dtypes, additional_scalar_names,
-        additional_scalar_dtypes, variant_name, variant_decl, pos_encoding_mode,
-        use_sliding_window, use_logits_soft_cap, use_fp16_qk_reduction, fp8_enabled,
+        backend,
+        uri,
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        idtype,
+        head_dim_qk,
+        head_dim_vo,
+        additional_tensor_names,
+        additional_tensor_dtypes,
+        additional_scalar_names,
+        additional_scalar_dtypes,
+        variant_name,
+        variant_decl,
+        pos_encoding_mode,
+        use_sliding_window,
+        use_logits_soft_cap,
+        use_fp16_qk_reduction,
+        fp8_enabled,
         [0, 1, 2, 3],
         is_batch=True,
     )
@@ -1880,6 +1953,7 @@ def _gen_customize_batch_prefill_module_impl(
     mask_modes: Optional[List[int]] = None,
     is_block_extend: bool = False,
     is_batch: bool = False,
+    use_profiler: bool = False,
 ) -> JitSpec:
     kwargs = {
         "variant_decl": variant_decl,
@@ -1912,7 +1986,10 @@ def _gen_customize_batch_prefill_module_impl(
         )
 
         kwargs["dispatch_context"] = _customize_prefill_dispatch_context(
-            variant_name, is_batch=is_batch, is_sm90=False, is_block_extend=is_block_extend
+            variant_name,
+            is_batch=is_batch,
+            is_sm90=False,
+            is_block_extend=is_block_extend,
         )
 
         with open(
@@ -1977,12 +2054,15 @@ def _gen_customize_batch_prefill_module_impl(
 
         generated_config_path = gen_directory / "batch_prefill_config.inc"
         write_if_different(generated_config_path, generated_inc_str)
+        _extra_cflags = (
+            _fa2_prefill_head_dim_nvcc_flags(head_dim_qk, head_dim_vo, dtype_kv) or []
+        )
+        if use_profiler or os.environ.get("FLASHINFER_ENABLE_PROFILER_BE", "") == "1":
+            _extra_cflags += ["-DFLASHINFER_ENABLE_PROFILER"]
         return gen_jit_spec(
             uri,
             source_paths,
-            extra_cuda_cflags=_fa2_prefill_head_dim_nvcc_flags(
-                head_dim_qk, head_dim_vo, dtype_kv
-            ),
+            extra_cuda_cflags=_extra_cflags,
         )
     elif backend == "fa3":
         gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
@@ -2007,7 +2087,10 @@ def _gen_customize_batch_prefill_module_impl(
             _file_csrc = "batch_prefill_sm90.cu"
 
         kwargs["dispatch_context"] = _customize_prefill_dispatch_context(
-            variant_name, is_batch=is_batch, is_sm90=True, is_block_extend=is_block_extend
+            variant_name,
+            is_batch=is_batch,
+            is_sm90=True,
+            is_block_extend=is_block_extend,
         )
 
         with open(jit_env.FLASHINFER_CSRC_DIR / _file_config) as f:
@@ -2060,10 +2143,13 @@ def _gen_customize_batch_prefill_module_impl(
 
         generated_config_path = gen_directory / "batch_prefill_sm90_config.inc"
         write_if_different(generated_config_path, generated_inc_str)
+        _extra_cflags_fa3 = list(sm90a_nvcc_flags)
+        if use_profiler or os.environ.get("FLASHINFER_ENABLE_PROFILER_BE", "") == "1":
+            _extra_cflags_fa3 += ["-DFLASHINFER_ENABLE_PROFILER"]
         return gen_jit_spec(
             uri,
             source_paths,
-            extra_cuda_cflags=sm90a_nvcc_flags,
+            extra_cuda_cflags=_extra_cflags_fa3,
         )
     else:
         raise ValueError(f"Invalid backend: {backend}")

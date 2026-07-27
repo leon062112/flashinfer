@@ -548,7 +548,8 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
                                    uint32_t page_size, uint32_t max_batch_size_if_split,
                                    bool enable_cuda_graph, int32_t window_left,
                                    int32_t fixed_split_size, bool disable_split_kv,
-                                   int64_t uniform_q_len) {
+                                   int64_t uniform_q_len, int64_t mask_mode,
+                                   int64_t dllm_block_size, IdType* q_offsets_h = nullptr) {
   std::vector<IdType> request_indices, qo_tile_indices, kv_tile_indices, merge_indptr, o_indptr;
   merge_indptr.push_back(0);
   o_indptr.push_back(0);
@@ -623,13 +624,27 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
     }
   }
 
-  // Calculate the actual needed CTA when considering sliding window
+  // Calculate the actual needed CTA when considering mask mode and sliding window
   std::vector<int64_t> effective_kv_len_arr(batch_size);
   for (uint32_t i = 0; i < batch_size; ++i) {
-    // pad CTA_TILE_Q to consider the causal kv-len
-    effective_kv_len_arr[i] =
-        std::min(window_left >= 0 ? ceil_div(window_left + cta_tile_q, page_size) : kv_len_arr[i],
-                 kv_len_arr[i]);
+    if (mask_mode == 4 && dllm_block_size > 0) {
+      // BLOCK_EXTEND mask: mask[q, k] = (q_global / B) >= (kv_global / B)
+      // For the last Q token in a batch item, KV up to the end of its block is visible.
+      // KV positions beyond that block are completely masked and can be pruned.
+      // Account for q_offset (global start position) for incremental prefill steps.
+      int64_t qo_len_tokens = packed_qo_len_arr[i] / int64_t(gqa_group_size);
+      int64_t q_offset = (q_offsets_h != nullptr) ? (int64_t)q_offsets_h[i] : 0;
+      int64_t q_last_global = q_offset + qo_len_tokens - 1;
+      int64_t q_last_block = (qo_len_tokens > 0) ? q_last_global / dllm_block_size : 0;
+      int64_t max_kv_global_tokens = (q_last_block + 1) * dllm_block_size;
+      int64_t block_kv_end_pages = ceil_div(max_kv_global_tokens, (int64_t)page_size);
+      effective_kv_len_arr[i] = std::min(block_kv_end_pages, kv_len_arr[i]);
+    } else {
+      // pad CTA_TILE_Q to consider the causal kv-len
+      effective_kv_len_arr[i] =
+          std::min(window_left >= 0 ? ceil_div(window_left + cta_tile_q, page_size) : kv_len_arr[i],
+                   kv_len_arr[i]);
+    }
   }
   bool split_kv = false;
   int64_t kv_chunk_size;
@@ -768,9 +783,11 @@ inline cudaError_t PrefillPlanImpl(
     uint32_t num_kv_heads, uint32_t head_dim_qk, uint32_t head_dim_vo, uint32_t page_size,
     bool enable_cuda_graph, uint32_t sizeof_dtype_o, int32_t window_left, int32_t fixed_split_size,
     bool disable_split_kv,
+    int64_t mask_mode,           // for kBlockExtend mask pruning in plan
+    int64_t dllm_block_size,     // block size for kBlockExtend mask pruning in plan
     int64_t num_colocated_ctas,  // for POD attention, limit prefill
                                  // splits by #colocated decode CTAs
-    int64_t uniform_q_len, cudaStream_t stream) {
+    int64_t uniform_q_len, IdType* q_offsets_h, cudaStream_t stream) {
   (void)head_dim_qk;
   (void)sizeof_dtype_o;
   if (num_qo_heads % num_kv_heads != 0) {
@@ -796,7 +813,7 @@ inline cudaError_t PrefillPlanImpl(
       PrefillSplitQOKVIndptr(qo_indptr_h, kv_indptr_h, total_num_rows, batch_size, num_qo_heads,
                              num_kv_heads, head_dim_vo, page_size, max_batch_size_if_split,
                              enable_cuda_graph, window_left, fixed_split_size, disable_split_kv,
-                             uniform_q_len);
+                             uniform_q_len, mask_mode, dllm_block_size, q_offsets_h);
 
   plan_info.cta_tile_q = cta_tile_q;
   plan_info.total_num_rows = total_num_rows;
@@ -902,18 +919,20 @@ inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_i
                                uint32_t head_dim_qk, uint32_t head_dim_vo, uint32_t page_size,
                                bool enable_cuda_graph, uint32_t sizeof_dtype_o, int32_t window_left,
                                int32_t fixed_split_size, bool disable_split_kv,
+                               int64_t mask_mode,        // for kBlockExtend mask pruning in plan
+                               int64_t dllm_block_size,  // block size for kBlockExtend mask pruning
                                int64_t num_colocated_ctas,  // for POD attention, limit prefill
                                                             // splits by #colocated decode CTAs
-                               int64_t uniform_q_len, cudaStream_t stream) {
+                               int64_t uniform_q_len, IdType* q_offsets_h, cudaStream_t stream) {
   size_t used_float_workspace_size = 0;
   size_t used_int_workspace_size = 0;
-  return PrefillPlanImpl<true>(used_float_workspace_size, used_int_workspace_size, float_buffer,
-                               float_workspace_size_in_bytes, int_buffer, page_locked_int_buffer,
-                               int_workspace_size_in_bytes, plan_info, qo_indptr_h, kv_indptr_h,
-                               total_num_rows, batch_size, num_qo_heads, num_kv_heads, head_dim_qk,
-                               head_dim_vo, page_size, enable_cuda_graph, sizeof_dtype_o,
-                               window_left, fixed_split_size, disable_split_kv, num_colocated_ctas,
-                               uniform_q_len, stream);
+  return PrefillPlanImpl<true>(
+      used_float_workspace_size, used_int_workspace_size, float_buffer,
+      float_workspace_size_in_bytes, int_buffer, page_locked_int_buffer,
+      int_workspace_size_in_bytes, plan_info, qo_indptr_h, kv_indptr_h, total_num_rows, batch_size,
+      num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo, page_size, enable_cuda_graph,
+      sizeof_dtype_o, window_left, fixed_split_size, disable_split_kv, mask_mode, dllm_block_size,
+      num_colocated_ctas, uniform_q_len, q_offsets_h, stream);
 }
 
 template <typename IdType>
@@ -922,16 +941,17 @@ inline cudaError_t PrefillPlanWorkspaceSize(
     IdType* kv_indptr_h, uint32_t total_num_rows, uint32_t batch_size, uint32_t num_qo_heads,
     uint32_t num_kv_heads, uint32_t head_dim_qk, uint32_t head_dim_vo, uint32_t page_size,
     bool enable_cuda_graph, uint32_t sizeof_dtype_o, int32_t window_left, int32_t fixed_split_size,
-    bool disable_split_kv, int64_t num_colocated_ctas, int64_t uniform_q_len, cudaStream_t stream) {
+    bool disable_split_kv, int64_t mask_mode, int64_t dllm_block_size, int64_t num_colocated_ctas,
+    int64_t uniform_q_len, IdType* q_offsets_h, cudaStream_t stream) {
   PrefillPlanInfo plan_info;
-  return PrefillPlanImpl<false>(float_workspace_size_in_bytes, int_workspace_size_in_bytes,
-                                /*float_buffer=*/nullptr, /*float_workspace_size_in_bytes=*/0,
-                                /*int_buffer=*/nullptr, /*page_locked_int_buffer=*/nullptr,
-                                /*int_workspace_size_in_bytes=*/0, plan_info, qo_indptr_h,
-                                kv_indptr_h, total_num_rows, batch_size, num_qo_heads, num_kv_heads,
-                                head_dim_qk, head_dim_vo, page_size, enable_cuda_graph,
-                                sizeof_dtype_o, window_left, fixed_split_size, disable_split_kv,
-                                num_colocated_ctas, uniform_q_len, stream);
+  return PrefillPlanImpl<false>(
+      float_workspace_size_in_bytes, int_workspace_size_in_bytes,
+      /*float_buffer=*/nullptr, /*float_workspace_size_in_bytes=*/0,
+      /*int_buffer=*/nullptr, /*page_locked_int_buffer=*/nullptr,
+      /*int_workspace_size_in_bytes=*/0, plan_info, qo_indptr_h, kv_indptr_h, total_num_rows,
+      batch_size, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo, page_size,
+      enable_cuda_graph, sizeof_dtype_o, window_left, fixed_split_size, disable_split_kv, mask_mode,
+      dllm_block_size, num_colocated_ctas, uniform_q_len, q_offsets_h, stream);
 }
 
 inline float cost_function(int qo_len, int kv_len) { return 2 * float(qo_len) + kv_len; }
@@ -1011,7 +1031,8 @@ inline cudaError_t PrefillSM90Plan(
     PrefillPlanSM90Info& plan_info, IdType* qo_indptr_h, IdType* kv_indptr_h, IdType* kv_len_arr_h,
     uint32_t total_num_rows, uint32_t batch_size, uint32_t num_qo_heads, uint32_t num_kv_heads,
     uint32_t head_dim_qk, uint32_t head_dim_vo, uint32_t page_size, bool causal,
-    bool enable_cuda_graph, uint32_t sizeof_dtype_o, cudaStream_t stream) {
+    bool enable_cuda_graph, uint32_t sizeof_dtype_o, cudaStream_t stream, int64_t mask_mode = 0,
+    int64_t dllm_block_size = 0, IdType* q_offsets_h = nullptr) {
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads " << num_qo_heads << " should be divisible by num_kv_heads "
@@ -1070,9 +1091,23 @@ inline cudaError_t PrefillSM90Plan(
         auto [cta_idx, accum_cost] = cta_cost_heap.pop();
         // NOTE(Zihao): our current FA3 implementation do not fuse query and group heads
         // so the group_size in cost_function is always 1
-        int effective_kv_len =
-            causal ? packed_causal_kv_end(qo_len, kv_len, qo_tile_idx, cta_tile_q, num_qo_tiles, 1)
-                   : kv_len;
+        int effective_kv_len;
+        if (mask_mode == 4 && dllm_block_size > 0) {
+          // BLOCK_EXTEND mask: mask[q, k] = (q_global / B) >= (kv_global / B)
+          // Per-tile effective KV length based on the tile's Q end position.
+          // Account for q_offset (global start) for incremental prefill steps.
+          int q_tile_end = std::min((qo_tile_idx + 1) * cta_tile_q, qo_len);
+          int q_offset = (q_offsets_h != nullptr) ? (int)q_offsets_h[i] : 0;
+          int q_tile_end_global = q_offset + q_tile_end;
+          int q_last_block =
+              (q_tile_end_global > 0) ? (q_tile_end_global - 1) / (int)dllm_block_size : 0;
+          int max_visible_kv = (q_last_block + 1) * (int)dllm_block_size;
+          effective_kv_len = std::min(max_visible_kv, kv_len);
+        } else {
+          effective_kv_len = causal ? packed_causal_kv_end(qo_len, kv_len, qo_tile_idx, cta_tile_q,
+                                                           num_qo_tiles, 1)
+                                    : kv_len;
+        }
         cta_cost_heap.insert({cta_idx, accum_cost + cost_function(cta_tile_q, effective_kv_len)});
         cta_qo_tile_indices[cta_idx].push_back(qo_tile_idx);
         cta_qo_indptr[cta_idx].push_back(qo_indptr_h[i]);
